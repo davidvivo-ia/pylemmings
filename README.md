@@ -32,10 +32,13 @@ python pylemmings.py
 | `--demo N` | El autopiloto juega la solución del nivel N. |
 | `--replay F` | Reproduce una partida guardada con `R` en la pantalla de resultado. |
 | `--all` | Desbloquea todos los niveles. |
+| `--infinito` | Empieza con habilidades infinitas. |
 | `--mute` | Sin sonido. |
 | `--selftest` | Tests de física y de niveles, sin ventana. |
 
-El progreso se guarda en `~/.pylemmings.json`. Si ese fichero no se puede escribir, el juego funciona igual.
+**Habilidades infinitas.** En el menú y en la pantalla previa de cada nivel hay un interruptor (clic, o tecla `I`). Al activarlo están disponibles las ocho habilidades sin límite en cualquier nivel, y el panel muestra ∞. Es para practicar o para jugar sin presión. Las victorias en ese modo también desbloquean el siguiente nivel, pero la pantalla de resultado indica que fue con habilidades infinitas. Las repeticiones guardan el modo para reproducirse exactas.
+
+El progreso y la preferencia de habilidades se guardan en `~/.pylemmings.json`. Si ese fichero no se puede escribir, el juego funciona igual.
 
 ---
 
@@ -52,6 +55,7 @@ El progreso se guarda en `~/.pylemmings.json`. Si ese fichero no se puede escrib
 | Flechas, `A`/`D`, ratón en el borde, rueda | Scroll (`Shift` va más rápido) |
 | Clic en el minimapa | Saltar a esa zona |
 | `M` | Música sí/no |
+| Interruptor del menú y de la previa, o `I` | Habilidades limitadas ↔ infinitas |
 | `Esc` | Abandonar el nivel / volver al menú |
 
 **Prioridad del cursor:** si hay varios lemmings bajo el cursor, la habilidad va al que puede recibirla. Por ejemplo, nunca se da un constructor a uno que ya está construyendo.

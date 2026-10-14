@@ -65,6 +65,7 @@ SPLAT_TICKS = 16
 DROWN_TICKS = 20
 BURN_TICKS = 14
 RR_MAX = 99
+INFINITE = 999  # recuento mostrado como ∞ en el modo de habilidades infinitas
 
 
 def release_interval(rr: int) -> int:
@@ -1899,8 +1900,9 @@ Command = tuple  # ("assign", id, skill) | ("rr", valor) | ("nuke",)
 class World:
     """Simulación determinista. No sabe que pygame existe."""
 
-    def __init__(self, level: Level, seed: int = 1991):
+    def __init__(self, level: Level, seed: int = 1991, infinite: bool = False):
         self.level = level
+        self.infinite = infinite  # habilidades sin límite (no se gastan)
         kinds, hazard, self.entrances, self.exits, self.traps = parse_map(level.map)
         rng = np.random.default_rng(seed)
         theme = THEMES[level.theme]
@@ -1908,7 +1910,7 @@ class World:
         self.hazard = hazard
         self.rng = rng
         self.total = level.lemmings
-        self.skills: dict[Skill, int] = {s: level.skills.get(s, 0) for s in SKILLS}
+        self.skills: dict[Skill, int] = {s: (INFINITE if infinite else level.skills.get(s, 0)) for s in SKILLS}
         self.rr_min = self.rr = level.rr
         self.tick_count = 0
         self.time_left = level.minutes * 60 * TPS
@@ -1997,7 +1999,8 @@ class World:
         L = self.by_id.get(lid)
         if L is None or self.skills[skill] <= 0 or not self.can_assign(L, skill):
             return False
-        self.skills[skill] -= 1
+        if not self.infinite:
+            self.skills[skill] -= 1
         match skill:
             case Skill.CLIMBER:
                 L.climber = True
@@ -2784,6 +2787,8 @@ class Sfx:
 
 BTN_W = 20
 PAGE = 10
+TOGGLE_MENU_Y = 162
+TOGGLE_PREVIEW_Y = 162
 RATINGS = ["Paseo", "Ingenio", "Sudor", "Caos", "Leyenda"]
 BTN_RR_DOWN, BTN_RR_UP, BTN_PAUSE, BTN_NUKE = 0, 1, 10, 11
 MINI = pygame.Rect(242, VIEW_H + 11, 76, 28)
@@ -2796,16 +2801,17 @@ UI_ACC = (90, 220, 90)
 UI_BAD = (240, 90, 80)
 
 
-def load_progress() -> int:
+def load_progress() -> dict:
     try:
-        return int(json.loads(PROGRESS_FILE.read_text())["unlocked"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return 0
+        data = json.loads(PROGRESS_FILE.read_text())
+        return {"unlocked": int(data.get("unlocked", 0)), "infinite": bool(data.get("infinite", False))}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {"unlocked": 0, "infinite": False}
 
 
-def save_progress(unlocked: int) -> None:
+def save_progress(unlocked: int, infinite: bool) -> None:
     try:
-        PROGRESS_FILE.write_text(json.dumps({"unlocked": unlocked}))
+        PROGRESS_FILE.write_text(json.dumps({"unlocked": unlocked, "infinite": infinite}))
     except OSError:
         pass
 
@@ -2857,7 +2863,9 @@ class App:
             k: pygame.transform.scale(self.sprites.icon(k), (8 * s, self.sprites.icon(k).get_height() * s)) for k in SKILLS
         }
         self.sfx = Sfx(not args.mute)
-        self.unlocked = len(LEVELS) - 1 if args.all else min(load_progress(), len(LEVELS) - 1)
+        prog = load_progress()
+        self.unlocked = len(LEVELS) - 1 if args.all else min(prog["unlocked"], len(LEVELS) - 1)
+        self.infinite = args.infinito or prog["infinite"]
         self.sel = self.unlocked
         self.mode = "menu"
         self.frame = 0
@@ -2866,7 +2874,8 @@ class App:
         self.result: dict | None = None
         if args.replay:
             data = json.loads(Path(args.replay).read_text())
-            self.start_play(int(data["level"]), pilot=Replay(data["commands"]), demo=True)
+            self.start_play(int(data["level"]), pilot=Replay(data["commands"]), demo=True,
+                            infinite=bool(data.get("infinite", False)))
         elif args.demo:
             self.start_play(args.demo - 1, pilot=Autopilot(LEVELS[args.demo - 1].solution), demo=True)
         elif args.level:
@@ -2885,16 +2894,47 @@ class App:
         self.screen.blit(img, (x, y))
 
     # ── transiciones ─────────────────────────────────────────────────────
+    def toggle_rect(self, y: float) -> pygame.Rect:
+        return self.R(VIEW_W / 2 - 70, y, 140, 11)
+
+    def draw_infinity(self, cx: float, cy: float) -> None:
+        """Símbolo ∞ dibujado a mano (la fuente por defecto no lo trae)."""
+        for dx in (-2.2, 2.2):
+            pygame.draw.circle(self.screen, UI_FG, (int((cx + dx) * self.s), int(cy * self.s)), int(2.4 * self.s),
+                               max(1, self.s * 2 // 3))
+
+    def draw_toggle(self, y: float) -> None:
+        """Interruptor clicable: habilidades limitadas / infinitas."""
+        rect = self.toggle_rect(y)
+        hover = rect.collidepoint(pygame.mouse.get_pos())
+        on = self.infinite
+        pygame.draw.rect(self.screen, (60, 120, 60) if on else (55, 48, 85), rect, border_radius=4 * self.s)
+        pygame.draw.rect(self.screen, (255, 255, 255) if hover else (110, 100, 150), rect, max(1, self.s // 2),
+                         border_radius=4 * self.s)
+        knob = self.R(VIEW_W / 2 + (58 if on else -68), y + 1.5, 8, 8)
+        pygame.draw.ellipse(self.screen, (255, 225, 40) if on else UI_DIM, knob)
+        label = "Habilidades: infinitas" if on else "Habilidades: limitadas"
+        self.text(label + "  (clic o I)", self.f_small, (VIEW_W / 2, y + 1.5), UI_FG, center=True)
+
+    def toggle_infinite(self) -> None:
+        self.infinite = not self.infinite
+        save_progress(self.unlocked, self.infinite)
+        self.sfx.play("click")
+        if self.mode == "preview" and self.preview:
+            self.open_preview(self.preview[0])
+
     def open_preview(self, idx: int) -> None:
-        w = World(LEVELS[idx])
+        w = World(LEVELS[idx], infinite=self.infinite)
         self.preview = (idx, w, Renderer(w, self.sprites))
         self.mode = "preview"
 
-    def start_play(self, idx: int, pilot=None, demo: bool = False) -> None:
+    def start_play(self, idx: int, pilot=None, demo: bool = False, infinite: bool | None = None) -> None:
         if self.preview and self.preview[0] == idx and pilot is None:
             _, w, r = self.preview
         else:
-            w = World(LEVELS[idx])
+            if infinite is None:
+                infinite = self.infinite and not demo
+            w = World(LEVELS[idx], infinite=infinite)
             r = Renderer(w, self.sprites)
         self.preview = None
         cam = w.entrances[0].x - VIEW_W // 2 if w.entrances else 0
@@ -2911,9 +2951,9 @@ class App:
         ok = w.success and not p.aborted
         if ok and not p.demo and p.idx + 1 > self.unlocked and p.idx + 1 < len(LEVELS):
             self.unlocked = p.idx + 1
-            save_progress(self.unlocked)
+            save_progress(self.unlocked, self.infinite)
         self.result = {"idx": p.idx, "saved": w.saved, "total": w.total, "need": w.level.to_save, "ok": ok,
-                       "log": p.log, "demo": p.demo, "saved_file": None}
+                       "log": p.log, "demo": p.demo, "saved_file": None, "infinite": w.infinite}
         self.sfx.stop_music()
         self.mode = "result"
 
@@ -2955,8 +2995,12 @@ class App:
                 self.sel = (self.sel + PAGE) % len(LEVELS)
             elif ev.key in (pygame.K_RETURN, pygame.K_SPACE) and self.sel <= self.unlocked:
                 self.open_preview(self.sel)
+            elif ev.key == pygame.K_i:
+                self.toggle_infinite()
             elif ev.key == pygame.K_d and self.sel <= self.unlocked:
                 self.start_play(self.sel, pilot=Autopilot(LEVELS[self.sel].solution), demo=True)
+        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and self.toggle_rect(TOGGLE_MENU_Y).collidepoint(ev.pos):
+            self.toggle_infinite()
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             row = int((ev.pos[1] / self.s - 62) // 10) + self.sel // PAGE * PAGE
             if 0 <= row - self.sel // PAGE * PAGE < PAGE and row < len(LEVELS) and row <= self.unlocked:
@@ -2978,8 +3022,9 @@ class App:
             mark = ">" if i == self.sel else " "
             label = f"{mark} {i + 1:2d}. {lv.name}" + ("   (bloqueado)" if locked else "")
             self.text(label, self.f_med, (60, y), color)
+        self.draw_toggle(TOGGLE_MENU_Y)
         self.text("Flechas: elegir (izq./der.: dificultad)  ·  Enter: jugar  ·  D: demo  ·  M: música  ·  Esc: salir",
-                  self.f_small, (VIEW_W / 2, 172), UI_DIM, center=True)
+                  self.f_small, (VIEW_W / 2, 176), UI_DIM, center=True)
         x = (self.frame // 2) % (VIEW_W + 40) - 20
         img = pygame.transform.scale(self.sprites.get("walk", self.frame // 4, 1), (8 * self.s, 10 * self.s))
         self.screen.blit(img, (x * self.s, 184 * self.s))
@@ -2992,8 +3037,13 @@ class App:
                 self.mode = "menu"
             elif ev.key in (pygame.K_RETURN, pygame.K_SPACE):
                 self.start_play(self.preview[0])
+            elif ev.key == pygame.K_i:
+                self.toggle_infinite()
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            self.start_play(self.preview[0])
+            if self.toggle_rect(TOGGLE_PREVIEW_Y).collidepoint(ev.pos):
+                self.toggle_infinite()
+            else:
+                self.start_play(self.preview[0])
         return None
 
     def draw_preview(self) -> None:
@@ -3009,9 +3059,13 @@ class App:
         pct = round(100 * lv.to_save / lv.lemmings)
         self.text(f"{lv.lemmings} lemmings  ·  rescatar {lv.to_save} ({pct} %)", self.f_med, (VIEW_W / 2, 108), center=True)
         self.text(f"Tasa de salida {lv.rr}  ·  Tiempo {lv.minutes} min", self.f_med, (VIEW_W / 2, 120), center=True)
-        skills = [f"{SKILL_NAMES[k]} {lv.skills[k]}" for k in SKILLS if lv.skills.get(k)]
+        if w.infinite:
+            skills = ["Todas las habilidades, sin límite"]
+        else:
+            skills = [f"{SKILL_NAMES[k]} {lv.skills[k]}" for k in SKILLS if lv.skills.get(k)]
         for row in range(0, len(skills), 4):
             self.text("  ·  ".join(skills[row : row + 4]), self.f_small, (VIEW_W / 2, 136 + row / 4 * 10), UI_ACC, center=True)
+        self.draw_toggle(TOGGLE_PREVIEW_Y)
         self.text("Clic o Enter para empezar  ·  Esc: volver", self.f_small, (VIEW_W / 2, 182), UI_DIM, center=True)
 
     # ── partida ──────────────────────────────────────────────────────────
@@ -3216,7 +3270,10 @@ class App:
                 self.text("+", self.f_big, (cx, top + 21), UI_FG, center=True)
             elif 2 <= i <= 9:
                 k = SKILLS[i - 2]
-                num = str(w.skills[k]) if w.skills[k] else ""
+                if w.infinite:
+                    self.draw_infinity(cx, top + 15.5)
+                else:
+                    num = str(w.skills[k]) if w.skills[k] else ""
                 icon = self.icons[k]
                 self.screen.blit(icon, (int(cx * s - icon.get_width() / 2), int((top + 39) * s - icon.get_height())))
             elif i == BTN_PAUSE:
@@ -3248,7 +3305,7 @@ class App:
         elif key == pygame.K_r and not r["demo"]:
             path = Path.cwd() / f"pylemmings_nivel{r['idx'] + 1:02d}.json"
             try:
-                path.write_text(json.dumps({"level": r["idx"], "commands": r["log"]}))
+                path.write_text(json.dumps({"level": r["idx"], "infinite": r["infinite"], "commands": r["log"]}))
                 r["saved_file"] = path.name
             except OSError as exc:
                 r["saved_file"] = f"error: {exc}"
@@ -3283,6 +3340,8 @@ class App:
         self.text(f"Has rescatado el {pct} %", self.f_big, (VIEW_W / 2, 62), UI_ACC if r["ok"] else UI_BAD, center=True)
         self.text(f"Necesitabas el {need} %  ·  {r['saved']} de {r['total']} (mínimo {r['need']})", self.f_med, (VIEW_W / 2, 82), center=True)
         self.text(msg, self.f_med, (VIEW_W / 2, 104), center=True)
+        if r["infinite"]:
+            self.text("(con habilidades infinitas)", self.f_small, (VIEW_W / 2, 118), UI_DIM, center=True)
         nxt = "siguiente nivel" if r["ok"] and not r["demo"] and not last else "reintentar"
         line = f"Enter: {nxt}  ·  Esc: menú"
         if not r["demo"]:
@@ -3407,6 +3466,13 @@ def selftest() -> int:
     _run(w, 30)
     check("el bloqueador da media vuelta a los demás", L.dir == -1 and L.x < 60, f"x={L.x}")
 
+    w = World(LEVELS[0], infinite=True)
+    L = _put(w, 60, 120)
+    ok = all(w.assign(L.id, Skill.CLIMBER if i == 0 else Skill.FLOATER if i == 1 else Skill.BLOCKER) for i in range(3))
+    check("modo infinito: asigna sin gastar", ok and w.skills[Skill.DIGGER] == INFINITE and w.skills[Skill.BLOCKER] == INFINITE)
+    w = World(LEVELS[0])
+    check("modo normal: solo las del nivel", w.skills[Skill.DIGGER] == 10 and w.skills[Skill.CLIMBER] == 0)
+
     print("Niveles (solución automática):")
     for i, lv in enumerate(LEVELS):
         widths = {len(r) for r in lv.map}
@@ -3437,6 +3503,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--demo", type=int, choices=range(1, len(LEVELS) + 1), metavar="N", help="ver la solución del nivel N")
     ap.add_argument("--mute", action="store_true", help="sin sonido")
     ap.add_argument("--all", action="store_true", help="desbloquear todos los niveles")
+    ap.add_argument("--infinito", action="store_true", help="habilidades infinitas")
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
