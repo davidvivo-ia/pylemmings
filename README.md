@@ -1,12 +1,12 @@
 # pylemmings
 
-Un clon de *Lemmings* (DMA Design, 1991) escrito desde cero en **Python moderno (3.12+)**, en **un único fichero: `pylemmings.py`**. Trae 10 niveles propios, las 8 habilidades, sonido y música sintetizados, demos y repeticiones.
+Un clon de *Lemmings* (DMA Design, 1991) escrito desde cero en **Python moderno (3.12+)**, en **un único fichero: `pylemmings.py`**. Trae 50 niveles propios en cinco dificultades, las 8 habilidades, sonido y música sintetizados, demos y repeticiones.
 
 No usa gráficos, sonidos ni niveles originales. Todo lo que se ve se dibuja por código y los niveles están escritos como texto dentro del propio fichero. Del original solo se toma la **mecánica**, que no tiene copyright. Su **expresión** sí lo tiene: sprites, niveles, música y nombres.
 
 ```bash
 uv run pylemmings.py                 # jugar (uv instala pygame-ce y numpy solo)
-python pylemmings.py --selftest      # física y los 10 niveles, sin ventana
+python pylemmings.py --selftest      # física y los 50 niveles, sin ventana
 python pylemmings.py --demo 10       # ver la solución automática del nivel 10
 ```
 
@@ -58,22 +58,28 @@ El progreso se guarda en `~/.pylemmings.json`. Si ese fichero no se puede escrib
 
 ---
 
-## 3. Los diez niveles
+## 3. Los cincuenta niveles
 
-Todos son de diseño propio. Cada uno lleva su solución automática, que el `--selftest` ejecuta para demostrar que el nivel se puede ganar.
+Todos son de diseño propio. Están agrupados en cinco dificultades de diez niveles; en el menú, izquierda y derecha cambian de grupo. Cada nivel lleva su solución automática, que el `--selftest` ejecuta para demostrar que se puede ganar.
 
-| # | Nombre | Enseña | Lemmings / mínimo |
-|---|---|---|---|
-| 1 | Solo hay que cavar | Cavador | 10 / 6 |
-| 2 | Paracaídas para todos | Paracaidista | 10 / 8 |
-| 3 | Escaladores | Escalador | 10 / 9 |
-| 4 | Abre paso | Excavador | 10 / 9 |
-| 5 | Puente sobre el agua | Constructor + bloqueador + bombardero | 10 / 8 |
-| 6 | Cuesta abajo | Picador | 10 / 9 |
-| 7 | Dinamita | Bombardero contra suelos, entre paredes de acero | 10 / 8 |
-| 8 | Acero y sentido único | Construir sobre acero, excavar a favor de las flechas, cavar en la única grieta | 10 / 9 |
-| 9 | Puente y túnel | Combinación de cinco habilidades | 12 / 10 |
-| 10 | El gran final | Dos entradas, trampa, fuego, abismo y acero | 16 / 12 |
+| Grupo | Niveles | Lemmings | Tasa | Margen de rescate | Habilidades de sobra |
+|---|---|---|---|---|---|
+| Paseo | 1–10 | 10–16 | 40–50 | amplio | muchas |
+| Ingenio | 11–20 | 12 | 50 | ~20 % | +2 por habilidad |
+| Sudor | 21–30 | 16 | 60 | ~12 % | +1 |
+| Caos | 31–40 | 24 | 70 | ~6 % | +1 |
+| Leyenda | 41–50 | 32–40 | 80 | un lemming | ninguna |
+
+Los niveles 1–10 están diseñados a mano y enseñan una habilidad cada uno. Los 11–50 se compusieron con un taller de diseño, que no forma parte del repo, a partir de piezas con solución conocida:
+
+- fosos de agua o fuego para el constructor, de 3 a 6 bloques;
+- muros normales y de sentido único para el excavador;
+- suelos que hay que cavar, a veces con una sola grieta en el acero;
+- acantilados para el picador o para paraguas, y muros de escalada;
+- pozos de los que se sale construyendo, escalones de acero y suelos finos para dinamita;
+- trampas que hay que salvar por encima, rampas, techos de cueva, niveles espejados y niveles con dos entradas que convergen en una salida central.
+
+Después, cada nivel se calibró simulándolo: el mínimo de rescate, el tiempo (entre 2 y 3,2 veces lo que tarda el autopiloto, nunca menos de 3 minutos) y las habilidades de sobra dependen de su grupo. Los mapas resultantes están escritos en ASCII dentro de `pylemmings.py`, como los diez primeros, y se pueden editar a mano.
 
 Leyenda de los mapas (cada carácter es un bloque de 8×8 px; si un mapa tiene menos de 20 filas, se rellena con aire por arriba):
 
@@ -158,7 +164,7 @@ El selftest comprueba, sin ventana:
   - El picador baja en pendiente 1:2.
   - El escalador corona el muro.
   - El bloqueador da media vuelta a los demás.
-- **Niveles:** cada uno se gana con su solución, una repetición grabada reproduce la partida exactamente y dos ejecuciones dan el mismo terreno final.
+- **Niveles (los 50):** cada uno se gana con su solución, una repetición grabada reproduce la partida exactamente y dos ejecuciones dan el mismo terreno final.
 
 ---
 
