@@ -1,0 +1,2330 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["pygame-ce>=2.5", "numpy>=2.0"]
+# ///
+"""pylemmings: un clon de Lemmings (DMA Design, 1991) en un único fichero.
+
+Sin gráficos, sonidos ni niveles originales: todo se genera por código.
+
+    uv run pylemmings.py            # jugar
+    python pylemmings.py --selftest # física y niveles, sin ventana
+    python pylemmings.py --demo 5   # ver la solución del nivel 5
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import Path
+
+import numpy as np
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+import pygame  # noqa: E402
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. CONSTANTES
+# ═══════════════════════════════════════════════════════════════════════════
+
+TPS = 17  # ticks de lógica por segundo, como el original
+TICK_MS = 1000 / TPS
+VIEW_W, VIEW_H = 320, 160
+PANEL_H = 40
+CELL = 8  # un carácter del mapa ASCII = 8×8 píxeles
+ROWS = VIEW_H // CELL
+
+STEP_UP = 6  # escalón máximo que sube un caminante
+STEP_DOWN = 3  # bajada máxima sin pasar a caer
+FALL_SPEED = 3  # píxeles por tick en caída libre
+LETHAL_FALL = 60  # caer más de esto mata (sin paraguas)
+FLOAT_DELAY = 10  # ticks de caída (~30 px) antes de abrir el paraguas
+CLIMB_HEAD = 10  # altura de la cabeza para chocar con techos al trepar
+HOIST_TICKS = 5
+BRICKS = 12
+BRICK_TICKS = 16
+SHRUG_TICKS = 10
+BASH_CYCLE = 16
+BASH_MOVES = frozenset({2, 3, 4, 5, 10, 11, 12, 13})
+BASH_LOOKAHEAD = 8
+MINE_TICKS = 12
+DIG_TICKS = 8
+BOMB_TICKS = 5 * TPS
+OHNO_TICKS = 16
+BOMB_RADIUS = 16
+BLOCK_RANGE = 6
+HATCH_TICKS = 25
+TRAP_COOLDOWN = 3 * TPS
+EXIT_TICKS = 8
+SPLAT_TICKS = 16
+DROWN_TICKS = 20
+BURN_TICKS = 14
+RR_MAX = 99
+
+
+def release_interval(rr: int) -> int:
+    """Ticks entre lemmings para una tasa de salida 1–99."""
+    return max(4, 53 - rr // 2)
+
+
+# Tipos de terreno (un byte por píxel)
+AIR, DIRT, STEEL, OW_L, OW_R = range(5)
+# Peligros (mapa aparte: no son sólidos)
+HZ_NONE, HZ_WATER, HZ_FIRE = range(3)
+
+
+class Skill(StrEnum):
+    CLIMBER = "climber"
+    FLOATER = "floater"
+    BOMBER = "bomber"
+    BLOCKER = "blocker"
+    BUILDER = "builder"
+    BASHER = "basher"
+    MINER = "miner"
+    DIGGER = "digger"
+
+
+SKILLS: list[Skill] = list(Skill)
+SKILL_NAMES = {
+    Skill.CLIMBER: "Escalador",
+    Skill.FLOATER: "Paracaidista",
+    Skill.BOMBER: "Bombardero",
+    Skill.BLOCKER: "Bloqueador",
+    Skill.BUILDER: "Constructor",
+    Skill.BASHER: "Excavador",
+    Skill.MINER: "Picador",
+    Skill.DIGGER: "Cavador",
+}
+
+
+class St(StrEnum):
+    WALK = "walk"
+    FALL = "fall"
+    FLOAT = "float"
+    CLIMB = "climb"
+    HOIST = "hoist"
+    BLOCK = "block"
+    BUILD = "build"
+    SHRUG = "shrug"
+    BASH = "bash"
+    MINE = "mine"
+    DIG = "dig"
+    OHNO = "ohno"
+    SPLAT = "splat"
+    DROWN = "drown"
+    BURN = "burn"
+    EXIT = "exit"
+
+
+STATE_NAMES = {
+    St.WALK: "Caminante",
+    St.FALL: "Cayendo",
+    St.FLOAT: "Paracaidista",
+    St.CLIMB: "Escalador",
+    St.HOIST: "Escalador",
+    St.BLOCK: "Bloqueador",
+    St.BUILD: "Constructor",
+    St.SHRUG: "Constructor",
+    St.BASH: "Excavador",
+    St.MINE: "Picador",
+    St.DIG: "Cavador",
+    St.OHNO: "¡Oh, no!",
+    St.SPLAT: "¡Plaf!",
+    St.DROWN: "Ahogándose",
+    St.BURN: "Ardiendo",
+    St.EXIT: "A salvo",
+}
+
+DOOMED = frozenset({St.OHNO, St.SPLAT, St.DROWN, St.BURN, St.EXIT})
+GROUND_WORK = frozenset({St.WALK, St.SHRUG, St.BUILD, St.BASH, St.MINE, St.DIG})
+NEEDS_FLOOR = frozenset({St.WALK, St.SHRUG, St.BLOCK, St.BUILD, St.BASH})
+EXITABLE = frozenset({St.WALK, St.FALL, St.FLOAT, St.SHRUG, St.BUILD, St.BASH, St.MINE, St.DIG})
+AIRBORNE = frozenset({St.FALL, St.FLOAT, St.CLIMB, St.HOIST})
+
+
+def _circle(r: int) -> np.ndarray:
+    yy, xx = np.ogrid[-r : r + 1, -r : r + 1]
+    return xx * xx + yy * yy <= r * r
+
+
+BOMB_MASK = _circle(BOMB_RADIUS)
+BASH_MASK = np.ones((9, 5), dtype=bool)  # filas y-9..y-1, columnas +1..+5
+BASH_MASK[0, 3:] = False
+BASH_MASK[-1, 4] = False
+MINE_MASK = np.ones((10, 6), dtype=bool)  # filas y-9..y, columnas 0..+5
+MINE_MASK[0, 3:] = False
+MINE_MASK[1, 5] = False
+DIG_MASK = np.ones((1, 9), dtype=bool)  # fila y, columnas -4..+4
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. SPRITES (pixel art como texto; todo mira a la derecha)
+# ═══════════════════════════════════════════════════════════════════════════
+
+PALETTE = {
+    "G": (40, 200, 40),
+    "S": (245, 205, 170),
+    "B": (70, 90, 235),
+    "W": (255, 255, 255),
+    "R": (225, 45, 45),
+    "P": (175, 175, 185),
+    "K": (215, 150, 75),
+    "Y": (255, 225, 40),
+}
+
+_TOP = ["...GG...", "..GGGG..", "..GGSS..", "...SSS..", "...BB...", "..BBBS..", "..SBB...", "...BB..."]
+_LEGS = [
+    ["...BB...", "...BB..."],
+    ["..B.B...", "..B..B.."],
+    ["..B..B..", ".B...B.."],
+    ["...BB...", "..B.B..."],
+]
+_FALL = [
+    ["..S..S..", "..SGGS..", "..GGGG..", "..GGSS..", "...SS...", "..BBBB..", "...BB...", "...BB...", "..B..B..", "..B..B.."],
+    [".S....S.", "..SGGS..", "..GGGG..", "..GGSS..", "...SS...", "..BBBB..", "...BB...", "...BB...", "..B..B..", ".B....B."],
+]
+SPRITE_SRC: dict[str, list[list[str]]] = {
+    "walk": [_TOP + legs for legs in _LEGS],
+    "fall": _FALL,
+    "float": [
+        [
+            "..RRRR..", ".RRWWRR.", "RRRRRRRR", "R..P...R", "...P....", "..SPS...", "...GG...",
+            "..GGGG..", "..GGSS..", "...SSS..", "..BBBB..", "...BB...", "..B..B..", "..B..B..",
+        ],
+        [
+            "..RRRR..", ".RRWWRR.", "RRRRRRRR", "R..P...R", "...P....", "..SPS...", "...GG...",
+            "..GGGG..", "..GGSS..", "...SSS..", "..BBBB..", "...BB...", "...BB...", "..B..B..",
+        ],
+    ],
+    "climb": [
+        [".....S..", "...GGS..", "..GGGG..", "..GGSS..", "...SSS..", "...BBB..", "...BB...", "...BB...", "...B.B..", "....BB.."],
+        ["........", "...GG...", "..GGGGS.", "..GGSSS.", "...SSS..", "...BBB..", "...BB...", "....BB..", "....B...", "...BB..."],
+    ],
+    "block": [
+        ["...GG...", "..GGGG..", "..SSSS..", "...SS...", "SBBBBBBS", "...BB...", "...BB...", "...BB...", "..B..B..", ".BB..BB."],
+        ["...GG...", "..GGGG..", "..SSSS..", "S..SS..S", ".BBBBBB.", "...BB...", "...BB...", "...BB...", "..B..B..", ".BB..BB."],
+    ],
+    "build": [
+        ["........", "...GG...", "..GGGG..", "..GGSS..", "...SSS..", "..BBB...", "..BBBSKK", "..BBB...", "..BBBB..", "..B..B.."],
+        ["........", "...GG...", "..GGGG..", "..GGSS..", "...SSSKK", "..BBBS..", "..BBB...", "..BBB...", "..BBBB..", "..B..B.."],
+    ],
+    "shrug": [
+        ["...GG...", "..GGGG..", "S.GGSS.S", "S..SS..S", ".SBBBBS.", "...BB...", "...BB...", "...BB...", "..B..B..", "..B..B.."],
+    ],
+    "bash": [
+        ["...GG...", "..GGGG..", "..GGSS..", "...SSS..", "...BBSSS", "..BBB...", "...BB...", "...BB...", "..B..B..", ".B...B.."],
+        ["...GG.S.", "..GGGGS.", "..GGSSS.", "...SSS..", "...BBS..", "..BBB...", "...BB...", "...BB...", "..B..B..", ".B...B.."],
+    ],
+    "mine": [
+        ["....PPP.", "...GG.SP", "..GGGGS.", "..GGSSS.", "...SSS..", "..BBB...", "..BBB...", "...BB...", "..B..B..", ".B...B.."],
+        ["...GG...", "..GGGG..", "..GGSS..", "...SSS..", "..BBBSS.", "..BBB.SP", "...BB.PP", "...BB.P.", "..B..B..", ".B...B.."],
+    ],
+    "dig": [
+        ["...GG...", "..GGGG..", "..SSSS..", "...SS...", ".SBBBBS.", ".PBBBBP.", ".P.BB.P.", ".PPPPPP.", "..B..B..", "..B..B.."],
+        ["........", "...GG...", "..GGGG..", "..SSSS..", "...SS...", "SBBBBBBS", "P..BB..P", "PPPPPPPP", "..B..B..", "..B..B.."],
+    ],
+    "ohno": [
+        ["..SGGS..", "..SGGS..", "..SSSS..", "...SS...", "..BBBB..", "...BB...", "...BB...", "...BB...", "..B..B..", "..B..B.."],
+        ["........", "..SGGS..", "..SGGS..", "..SSSS..", "...SS...", "..BBBB..", "...BB...", "...BB...", "..B..B..", ".B....B."],
+    ],
+    "splat": [
+        ["........"] * 7 + ["...GG...", "..SBBS..", ".BBGGBB."],
+        ["........"] * 8 + [".S.GG.S.", "BBGGBBGG"],
+        ["........"] * 9 + ["BGBBGBBG"],
+    ],
+}
+
+DIGITS = {
+    "0": ["111", "101", "101", "101", "111"],
+    "1": ["010", "110", "010", "010", "111"],
+    "2": ["111", "001", "111", "100", "111"],
+    "3": ["111", "001", "011", "001", "111"],
+    "4": ["101", "101", "111", "001", "001"],
+    "5": ["111", "100", "111", "001", "111"],
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. TERRENO
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class Terrain:
+    """Mapa de bytes [y, x] con el tipo de cada píxel, más su color."""
+
+    def __init__(self, kinds: np.ndarray, colors: np.ndarray, bg: np.ndarray, brick: tuple[int, int, int]):
+        self.k = kinds
+        self.c = colors
+        self.bg = bg
+        self.brick = np.array(brick, dtype=np.uint8)
+        self.h, self.w = kinds.shape
+        self.dirty: tuple[int, int, int, int] | None = (0, 0, self.w, self.h)
+
+    def solid(self, x: int, y: int) -> bool:
+        if x < 0 or x >= self.w:
+            return True  # los laterales del mapa son muros
+        if y < 0 or y >= self.h:
+            return False
+        return self.k[y, x] != AIR
+
+    def _clip(self, x0: int, y0: int, mask: np.ndarray):
+        h, w = mask.shape
+        ax0, ay0 = max(x0, 0), max(y0, 0)
+        ax1, ay1 = min(x0 + w, self.w), min(y0 + h, self.h)
+        if ax0 >= ax1 or ay0 >= ay1:
+            return None
+        return ax0, ay0, ax1, ay1, mask[ay0 - y0 : ay1 - y0, ax0 - x0 : ax1 - x0]
+
+    @staticmethod
+    def _forbidden(region: np.ndarray, d: int) -> np.ndarray:
+        bad = region == STEEL
+        if d > 0:
+            bad |= region == OW_L
+        elif d < 0:
+            bad |= region == OW_R
+        return bad
+
+    def blocked(self, x0: int, y0: int, mask: np.ndarray, d: int) -> bool:
+        """¿Hay acero (o un muro de sentido contrario) bajo la máscara?"""
+        r = self._clip(x0, y0, mask)
+        if r is None:
+            return False
+        ax0, ay0, ax1, ay1, m = r
+        return bool((m & self._forbidden(self.k[ay0:ay1, ax0:ax1], d)).any())
+
+    def any_solid(self, x0: int, y0: int, mask: np.ndarray) -> bool:
+        r = self._clip(x0, y0, mask)
+        if r is None:
+            return False
+        ax0, ay0, ax1, ay1, m = r
+        return bool((m & (self.k[ay0:ay1, ax0:ax1] != AIR)).any())
+
+    def erase(self, x0: int, y0: int, mask: np.ndarray, d: int = 0) -> int:
+        r = self._clip(x0, y0, mask)
+        if r is None:
+            return 0
+        ax0, ay0, ax1, ay1, m = r
+        region = self.k[ay0:ay1, ax0:ax1]
+        hit = m & (region != AIR) & ~self._forbidden(region, d)
+        n = int(hit.sum())
+        if n:
+            region[hit] = AIR
+            self._mark(ax0, ay0, ax1, ay1)
+        return n
+
+    def add_row(self, xa: int, xb: int, y: int) -> None:
+        """Pinta un ladrillo horizontal de xa a xb (inclusive) en la fila y."""
+        if y < 0 or y >= self.h:
+            return
+        a, b = max(min(xa, xb), 0), min(max(xa, xb) + 1, self.w)
+        if a >= b:
+            return
+        seg = self.k[y, a:b]
+        air = seg == AIR
+        seg[air] = DIRT
+        self.c[y, a:b][air] = self.brick
+        self._mark(a, y, b, y + 1)
+
+    def _mark(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        if self.dirty is None:
+            self.dirty = (x0, y0, x1, y1)
+        else:
+            a, b, c, d = self.dirty
+            self.dirty = (min(a, x0), min(b, y0), max(c, x1), max(d, y1))
+
+
+@dataclass(frozen=True)
+class Theme:
+    dirt: tuple[tuple[int, int, int], ...]
+    grass: tuple[int, int, int]
+    sky_top: tuple[int, int, int]
+    sky_bot: tuple[int, int, int]
+    brick: tuple[int, int, int]
+
+
+THEMES = {
+    "tierra": Theme(((150, 90, 45), (120, 70, 35), (172, 112, 60)), (80, 175, 55), (8, 8, 36), (40, 22, 70), (235, 195, 120)),
+    "roca": Theme(((125, 120, 140), (95, 95, 115), (145, 135, 155)), (170, 170, 190), (4, 4, 14), (30, 30, 52), (225, 205, 160)),
+    "hielo": Theme(((150, 200, 232), (110, 168, 212), (190, 225, 246)), (245, 252, 255), (0, 10, 40), (20, 52, 92), (255, 236, 196)),
+    "cristal": Theme(((170, 80, 172), (128, 60, 150), (205, 112, 205)), (255, 185, 255), (14, 0, 24), (52, 12, 52), (250, 222, 150)),
+    "fuego": Theme(((140, 52, 32), (108, 36, 26), (172, 82, 42)), (232, 142, 42), (24, 0, 0), (72, 16, 10), (242, 202, 140)),
+}
+
+
+def colorize(kinds: np.ndarray, theme: Theme, rng: np.random.Generator) -> np.ndarray:
+    h, w = kinds.shape
+    pal = np.array(theme.dirt, dtype=float)
+    lo = rng.random((h // 5 + 2, w // 5 + 2))
+    big = np.repeat(np.repeat(lo, 5, axis=0), 5, axis=1)[:h, :w]
+    col = pal[np.minimum((big * len(pal)).astype(int), len(pal) - 1)]
+    yy, xx = np.mgrid[0:h, 0:w]
+    grain = 0.85 + 0.3 * rng.random((h, w))
+    col *= ((1 + 0.1 * np.sin(yy * 0.55 + np.sin(xx * 0.04) * 3)) * grain)[..., None]
+    solid = kinds != AIR
+    top = solid.copy()
+    top[1:] &= ~solid[:-1]
+    top2 = np.zeros_like(top)
+    top2[1:] = top[:-1] & solid[1:]
+    grass = np.array(theme.grass, dtype=float)
+    col[top] = grass * grain[top][:, None]
+    col[top2] = grass * 0.75 * grain[top2][:, None]
+    bx, by = xx % 8, yy % 8
+    sc = np.full((h, w), 150.0)
+    sc[(bx == 7) | (by == 7)] = 95
+    sc[(bx == 0) | (by == 0)] = 190
+    sc[((bx == 2) | (bx == 5)) & ((by == 2) | (by == 5))] = 215
+    steel = kinds == STEEL
+    col[steel] = np.stack([sc, sc, sc * 1.08], axis=-1)[steel]
+    col[(kinds == OW_R) & (((xx - np.abs(by - 4)) % 8) < 2)] *= 1.7
+    col[(kinds == OW_L) & (((xx + np.abs(by - 4)) % 8) < 2)] *= 1.7
+    return col.clip(0, 255).astype(np.uint8)
+
+
+def make_background(h: int, w: int, theme: Theme, rng: np.random.Generator) -> np.ndarray:
+    t = np.linspace(0, 1, h)[:, None, None]
+    bg = (np.array(theme.sky_top) * (1 - t) + np.array(theme.sky_bot) * t) * np.ones((1, w, 1))
+    stars = rng.random((h, w)) > 0.996
+    bg[stars] = 140 + rng.random(int(stars.sum()))[:, None] * 100
+    return bg.clip(0, 255).astype(np.uint8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. NIVELES
+# ═══════════════════════════════════════════════════════════════════════════
+# Leyenda (cada carácter = bloque de 8×8 px):
+#   .  aire         #  tierra       S  acero        < >  un solo sentido
+#   /  rampa sube   \  rampa baja   _  medio bloque = plataforma fina
+#   ~  agua         ^  fuego        T  trampa
+#   E  entrada (salen hacia la derecha)   e  entrada (hacia la izquierda)
+#   X  salida (debe tener suelo debajo)
+# Los mapas de menos de 20 filas se rellenan con aire por arriba.
+
+
+@dataclass(frozen=True, slots=True)
+class Rule:
+    """Paso de una solución automática (demo y selftest)."""
+
+    skill: Skill | None
+    x: int | None = None  # posición donde asignar (None = en cualquier sitio)
+    win: int = 1  # tolerancia en x
+    dir: int = 0  # 0 = cualquier sentido
+    state: St | None = None
+    y: tuple[int, int] = (-999, 9999)
+    n: int = 1  # cuántos lemmings
+    delay: int = 0  # ticks tras completar la regla anterior de su pista
+    par: bool = False  # no bloquea a las siguientes de su pista
+    track: int = 0  # pistas independientes (p. ej. dos entradas)
+    rr: int | None = None  # cambiar la tasa de salida
+
+
+@dataclass(frozen=True)
+class Level:
+    name: str
+    hint: str
+    lemmings: int
+    to_save: int
+    rr: int
+    minutes: int
+    skills: dict[Skill, int]
+    theme: str
+    map: tuple[str, ...]
+    solution: tuple[Rule, ...] = ()
+
+
+C, F, K, B, U, H, M, D = SKILLS  # K = bomba (bombardero), B = bloqueador
+
+LEVELS: list[Level] = [
+    Level(
+        "Solo hay que cavar",
+        "El suelo es grueso, pero la salida está debajo.",
+        10, 6, 50, 5, {D: 10}, "tierra",
+        (
+            "#................................................#",
+            "#................................................#",
+            "#.....E..........................................#",
+            "#................................................#",
+            "#................................................#",
+            "##################################################",
+            "##################################################",
+            "##################################################",
+            "#................................................#",
+            "#................................................#",
+            "#...................................X............#",
+            "##################################################",
+            "##################################################",
+        ),
+        (Rule(D, x=150, dir=1),),
+    ),
+    Level(
+        "Paracaídas para todos",
+        "Ochenta píxeles de caída. Sin paraguas, plaf.",
+        10, 8, 40, 5, {F: 10}, "hielo",
+        (
+            "#..........................................#",
+            "#.E........................................#",
+            "#..........................................#",
+            "######.....................................#",
+            "######.....................................#",
+            "######.....................................#",
+            "######.....................................#",
+            "######.....................................#",
+            "######.....................................#",
+            "######.....................................#",
+            "######.....................................#",
+            "######.....................................#",
+            "######...............................X.....#",
+            "############################################",
+        ),
+        (Rule(F, n=10, par=True),),
+    ),
+    Level(
+        "Escaladores",
+        "Un muro no es un final: es una pregunta.",
+        10, 9, 50, 5, {C: 10}, "roca",
+        (
+            "..................................................",
+            "..................................................",
+            "..................................................",
+            "..................................................",
+            "........................######....................",
+            "........................######....................",
+            "........................######....................",
+            "........................############..............",
+            "........................############..............",
+            "........................############..............",
+            "........................############..............",
+            "...E....................############..............",
+            "........................############.......X......",
+            "##################################################",
+            "##################################################",
+        ),
+        (Rule(C, n=10, par=True),),
+    ),
+    Level(
+        "Abre paso",
+        "Cuatro muros. Puños de lemming.",
+        10, 9, 50, 5, {H: 5}, "tierra",
+        (
+            "................................................................",
+            "..........##..........###...........##..........###.............",
+            "..E.......##..........###...........##..........###.............",
+            "..........##..........###...........##..........###.............",
+            "..........##..........###...........##..........###.......X.....",
+            "################################################################",
+            "################################################################",
+        ),
+        (
+            Rule(H, x=76, dir=1),
+            Rule(H, x=172, dir=1),
+            Rule(H, x=284, dir=1),
+            Rule(H, x=380, dir=1),
+        ),
+    ),
+    Level(
+        "Puente sobre el agua",
+        "Uno construye, otro frena a los demás. Y luego, la factura.",
+        10, 8, 50, 5, {U: 4, B: 2, K: 2}, "hielo",
+        (
+            "..........................................................",
+            "....E.....................................................",
+            "..........................................................",
+            ".................................................X........",
+            "#########################...##############################",
+            "#########################~~~##############################",
+            "#########################~~~##############################",
+            "##########################################################",
+        ),
+        (
+            Rule(U, x=199, win=0, dir=1),
+            Rule(B, x=175, dir=1),
+            Rule(K, state=St.BLOCK, delay=200),
+        ),
+    ),
+    Level(
+        "Cuesta abajo",
+        "Saltar desde ahí arriba es suicidio. Pica en diagonal.",
+        10, 9, 50, 5, {M: 3}, "roca",
+        (
+            "............................................................",
+            "............................................................",
+            "............................................................",
+            ".....................................###....................",
+            "...E.................................###....................",
+            ".....................................###....................",
+            "########################################....................",
+            "########################################....................",
+            "########################################....................",
+            "########################################....................",
+            "########################################....................",
+            "########################################....................",
+            "########################################....................",
+            "########################################....................",
+            "########################################....................",
+            "########################################....................",
+            "########################################..........X.........",
+            "############################################################",
+            "############################################################",
+            "############################################################",
+        ),
+        (Rule(M, x=240, dir=1),),
+    ),
+    Level(
+        "Dinamita",
+        "Paredes de acero. Suelos de tierra. Alguien tendrá que sacrificarse.",
+        10, 8, 50, 5, {K: 3}, "fuego",
+        (
+            "........................................",
+            "........................................",
+            "..........E.............................",
+            ".....S..............S...................",
+            ".....S..............S...................",
+            ".....S##############S...................",
+            ".....S..............S...................",
+            ".....S..............S...................",
+            ".....S..............S...................",
+            ".....S..............S...................",
+            ".....S##############S...................",
+            ".....S..............S...................",
+            ".....S..............S...................",
+            ".....S...X..........S...................",
+            ".....SSSSSSSSSSSSSSSS...................",
+            ".....SSSSSSSSSSSSSSSS...................",
+        ),
+        (
+            Rule(K, x=120, win=0, dir=1, y=(72, 72)),
+            Rule(K, x=130, win=0, dir=-1, y=(112, 112)),
+        ),
+    ),
+    Level(
+        "Acero y sentido único",
+        "Sube el escalón, respeta las flechas, cava donde se pueda.",
+        10, 9, 50, 6, {U: 2, H: 2, D: 2}, "cristal",
+        (
+            "............................................................",
+            "..........................................>>>...............",
+            "..........................................>>>...............",
+            "..E.......................................>>>...............",
+            "......................SS..................>>>...............",
+            "######################SS#####################SSSSS###SSSSSSS",
+            "######################SS#####################SSSSS###SSSSSSS",
+            "#############################################...............",
+            "#############################################...............",
+            "#############################################..........X....",
+            "############################################################",
+            "############################################################",
+        ),
+        (
+            Rule(U, x=156, dir=1),
+            Rule(H, x=330, dir=1),
+            Rule(D, x=411, win=0),
+        ),
+    ),
+    Level(
+        "Puente y túnel",
+        "Agua, una colina y un suelo de acero con una sola grieta.",
+        12, 10, 50, 6, {U: 3, B: 2, K: 2, H: 2, D: 2}, "tierra",
+        (
+            "......................................................................",
+            "..................................######..............................",
+            "..................................######..............................",
+            "...E..............................######..............................",
+            "..................................######..............................",
+            "..................................######..............................",
+            "##################...#########################SSSSSS###SSSSSSSSSSSSSSS",
+            "##################~~~#########################SSSSSS###SSSSSSSSSSSSSSS",
+            "##################~~~#########################........................",
+            "##############################################........................",
+            "##############################################..................X.....",
+            "######################################################################",
+            "######################################################################",
+        ),
+        (
+            Rule(U, x=143, win=0, dir=1),
+            Rule(B, x=119, dir=1),
+            Rule(K, state=St.BLOCK, delay=200),
+            Rule(H, x=268, dir=1),
+            Rule(D, x=427, win=0),
+        ),
+    ),
+    Level(
+        "El gran final",
+        "Dos puertas, una salida. Acero, trampa, fuego y un abismo.",
+        16, 12, 50, 8, {C: 10, F: 4, K: 4, B: 3, U: 4, H: 2, M: 3, D: 2}, "fuego",
+        (
+            "....................................................................................................",
+            "....................................................................................................",
+            "..............................................................................................e.....",
+            "....................................................................................................",
+            "......................................................................##############################",
+            ".........................SS...........................................##############################",
+            ".........................SS...........................................##############################",
+            ".........................SS#####......................................##############################",
+            ".........................SS#####......................................##############################",
+            ".........................SS#####......................................##############################",
+            "....E....................SS#####......................................##############################",
+            ".........................SS#####......T...X...........................##############################",
+            "#############################################...####################################################",
+            "#############################################^^^####################################################",
+            "#############################################^^^####################################################",
+            "####################################################################################################",
+            "####################################################################################################",
+            "####################################################################################################",
+            "####################################################################################################",
+            "####################################################################################################",
+        ),
+        (
+            # pista 0: grupo de la izquierda
+            Rule(C, x=100, win=100, n=8, par=True),
+            Rule(U, x=284, win=0, dir=1),
+            Rule(B, x=262, win=3, dir=1, state=St.WALK),
+            Rule(K, state=St.BLOCK, x=262, win=8, delay=210),
+            # pista 1: grupo de la derecha
+            Rule(M, x=670, dir=-1, track=1),
+            Rule(B, x=720, win=30, dir=-1, state=St.WALK, track=1),
+            Rule(U, x=384, win=0, dir=-1, track=1),
+            Rule(K, state=St.BLOCK, x=720, win=40, delay=150, track=1),
+        ),
+    ),
+]
+
+
+@dataclass(slots=True)
+class Entrance:
+    x: int
+    y: int
+    dir: int
+
+
+@dataclass(slots=True)
+class Exit:
+    x: int
+    y: int
+
+
+@dataclass(slots=True)
+class Trap:
+    x: int
+    y: int
+    w: int = CELL
+    h: int = CELL
+    cool: int = 0
+
+    def hits(self, x: int, y: int) -> bool:
+        return self.x <= x < self.x + self.w and self.y <= y < self.y + self.h
+
+
+def parse_map(rows: tuple[str, ...]):
+    width = max(len(r) for r in rows)
+    pad = max(0, ROWS - len(rows))
+    h, w = VIEW_H, width * CELL
+    kinds = np.zeros((h, w), dtype=np.uint8)
+    hazard = np.zeros((h, w), dtype=np.uint8)
+    entrances: list[Entrance] = []
+    exits: list[Exit] = []
+    traps: list[Trap] = []
+    tri = np.tri(CELL, dtype=bool)  # triángulo inferior izquierdo
+    for r, line in enumerate(rows):
+        y0 = (r + pad) * CELL
+        for c, ch in enumerate(line.ljust(width, ".")):
+            x0 = c * CELL
+            cell = kinds[y0 : y0 + CELL, x0 : x0 + CELL]
+            match ch:
+                case "#":
+                    cell[:] = DIRT
+                case "S":
+                    cell[:] = STEEL
+                case "<":
+                    cell[:] = OW_L
+                case ">":
+                    cell[:] = OW_R
+                case "/":
+                    cell[tri[:, ::-1]] = DIRT
+                case "\\":
+                    cell[tri] = DIRT
+                case "_":
+                    cell[CELL // 2 :] = DIRT
+                case "=":
+                    cell[:3] = DIRT
+                case "~":
+                    hazard[y0 : y0 + CELL, x0 : x0 + CELL] = HZ_WATER
+                case "^":
+                    hazard[y0 : y0 + CELL, x0 : x0 + CELL] = HZ_FIRE
+                case "E" | "e":
+                    entrances.append(Entrance(x0 + CELL // 2, y0 + CELL, 1 if ch == "E" else -1))
+                case "X":
+                    exits.append(Exit(x0 + CELL // 2, y0 + CELL))
+                case "T":
+                    traps.append(Trap(x0, y0))
+    entrances.sort(key=lambda e: e.x)
+    return kinds, hazard, entrances, exits, traps
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. LEMMING
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(slots=True, eq=False)
+class Lemming:
+    id: int
+    x: int  # píxel de los PIES: está de pie si terrain.solid(x, y)
+    y: int
+    dir: int = 1
+    state: St = St.FALL
+    frame: int = 0
+    fall: int = 0
+    climber: bool = False
+    floater: bool = False
+    bomb: int | None = None
+    bricks: int = 0
+    removed: bool = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. MUNDO
+# ═══════════════════════════════════════════════════════════════════════════
+
+Command = tuple  # ("assign", id, skill) | ("rr", valor) | ("nuke",)
+
+
+class World:
+    """Simulación determinista. No sabe que pygame existe."""
+
+    def __init__(self, level: Level, seed: int = 1991):
+        self.level = level
+        kinds, hazard, self.entrances, self.exits, self.traps = parse_map(level.map)
+        rng = np.random.default_rng(seed)
+        theme = THEMES[level.theme]
+        self.terrain = Terrain(kinds, colorize(kinds, theme, rng), make_background(*kinds.shape, theme, rng), theme.brick)
+        self.hazard = hazard
+        self.rng = rng
+        self.total = level.lemmings
+        self.skills: dict[Skill, int] = {s: level.skills.get(s, 0) for s in SKILLS}
+        self.rr_min = self.rr = level.rr
+        self.tick_count = 0
+        self.time_left = level.minutes * 60 * TPS
+        self.hatch = 0
+        self.release_timer = 0
+        self.released = 0
+        self.saved = 0
+        self.dead = 0
+        self.nuking = False
+        self.lemmings: list[Lemming] = []
+        self.by_id: dict[int, Lemming] = {}
+        self.blockers: list[Lemming] = []
+        self.particles: list[list] = []
+        self.events: list[str] = []
+
+    # ── consultas ────────────────────────────────────────────────────────
+    @property
+    def alive(self) -> int:
+        return sum(1 for L in self.lemmings if not L.removed)
+
+    @property
+    def done(self) -> bool:
+        if self.time_left <= 0:
+            return True
+        return self.alive == 0 and (self.released >= self.total or self.nuking)
+
+    @property
+    def success(self) -> bool:
+        return self.saved >= self.level.to_save
+
+    def can_assign(self, L: Lemming, skill: Skill) -> bool:
+        if L.removed or L.state in DOOMED:
+            return False
+        match skill:
+            case Skill.CLIMBER:
+                return not L.climber
+            case Skill.FLOATER:
+                return not L.floater
+            case Skill.BOMBER:
+                return L.bomb is None
+            case Skill.BLOCKER:
+                return L.state in GROUND_WORK
+            case Skill.BUILDER:
+                return L.state in GROUND_WORK and L.state != St.BUILD
+            case Skill.BASHER:
+                return L.state in GROUND_WORK and L.state != St.BASH
+            case Skill.MINER:
+                return L.state in GROUND_WORK and L.state != St.MINE
+            case Skill.DIGGER:
+                return L.state in GROUND_WORK and L.state != St.DIG
+        return False
+
+    def lemmings_at(self, cx: int, cy: int) -> list[Lemming]:
+        return [L for L in self.lemmings if not L.removed and abs(L.x - cx) <= 4 and L.y - 11 <= cy <= L.y + 1]
+
+    def pick(self, cx: int, cy: int, skill: Skill | None) -> tuple[Lemming | None, int]:
+        """Prioridad del cursor: primero los que pueden recibir la habilidad."""
+        cands = self.lemmings_at(cx, cy)
+        if not cands:
+            return None, 0
+        able = [L for L in cands if skill and self.can_assign(L, skill)]
+        pool = able or cands
+        best = min(pool, key=lambda L: (abs(L.x - cx) + abs(L.y - 5 - cy), L.id))
+        return best, len(cands)
+
+    # ── órdenes ──────────────────────────────────────────────────────────
+    def do(self, cmd: Command) -> bool:
+        match cmd:
+            case ("assign", lid, skill):
+                return self.assign(int(lid), Skill(skill))
+            case ("rr", value):
+                v = max(self.rr_min, min(RR_MAX, int(value)))
+                changed = v != self.rr
+                self.rr = v
+                return changed
+            case ("nuke",):
+                if self.nuking:
+                    return False
+                self.nuking = True
+                self.events.append("ohno")
+                return True
+        return False
+
+    def assign(self, lid: int, skill: Skill) -> bool:
+        L = self.by_id.get(lid)
+        if L is None or self.skills[skill] <= 0 or not self.can_assign(L, skill):
+            return False
+        self.skills[skill] -= 1
+        match skill:
+            case Skill.CLIMBER:
+                L.climber = True
+            case Skill.FLOATER:
+                L.floater = True
+            case Skill.BOMBER:
+                L.bomb = BOMB_TICKS
+            case Skill.BLOCKER:
+                self._set(L, St.BLOCK)
+            case Skill.BUILDER:
+                self._set(L, St.BUILD)
+                L.bricks = BRICKS
+            case Skill.BASHER:
+                self._set(L, St.BASH)
+            case Skill.MINER:
+                self._set(L, St.MINE)
+            case Skill.DIGGER:
+                self._set(L, St.DIG)
+        self.events.append("assign")
+        return True
+
+    # ── tick ─────────────────────────────────────────────────────────────
+    def tick(self) -> None:
+        if len(self.events) > 256:
+            del self.events[:-64]
+        self._release()
+        if self.nuking:
+            for L in self.lemmings:
+                if not L.removed and L.bomb is None and L.state not in DOOMED:
+                    L.bomb = BOMB_TICKS
+                    break
+        self.blockers = [L for L in self.lemmings if L.state == St.BLOCK and not L.removed]
+        for L in self.lemmings:
+            if L.removed:
+                continue
+            if L.bomb is not None and L.state not in DOOMED:
+                L.bomb -= 1
+                if L.bomb <= 0:
+                    L.bomb = None
+                    if L.state in AIRBORNE:
+                        self._explode(L)
+                        continue
+                    self._set(L, St.OHNO)
+                    self.events.append("ohno")
+            self._step(L)
+            if not L.removed:
+                self._hazards(L)
+        self.lemmings = [L for L in self.lemmings if not L.removed]
+        for t in self.traps:
+            if t.cool > 0:
+                t.cool -= 1
+        self._particles()
+        self.time_left -= 1
+        self.tick_count += 1
+
+    def _release(self) -> None:
+        if not self.entrances:
+            return
+        if self.hatch < HATCH_TICKS:
+            self.hatch += 1
+            if self.hatch == HATCH_TICKS:
+                self.events.append("letsgo")
+            return
+        if self.nuking or self.released >= self.total:
+            return
+        if self.release_timer <= 0:
+            e = self.entrances[self.released % len(self.entrances)]
+            L = Lemming(self.released, e.x, e.y, e.dir)
+            self.lemmings.append(L)
+            self.by_id[L.id] = L
+            self.released += 1
+            self.release_timer = release_interval(self.rr)
+        self.release_timer -= 1
+
+    # ── máquina de estados ───────────────────────────────────────────────
+    def _set(self, L: Lemming, st: St) -> None:
+        L.state = st
+        L.frame = 0
+        if st == St.FALL:
+            L.fall = 0
+
+    def _step(self, L: Lemming) -> None:
+        if L.state in NEEDS_FLOOR and not self.terrain.solid(L.x, L.y):
+            self._set(L, St.FALL)
+        match L.state:
+            case St.WALK:
+                self._walk(L)
+            case St.FALL:
+                self._fall(L)
+            case St.FLOAT:
+                self._float(L)
+            case St.CLIMB:
+                self._climb(L)
+            case St.HOIST:
+                L.frame += 1
+                if L.frame >= HOIST_TICKS:
+                    L.x += L.dir
+                    self._set(L, St.WALK)
+            case St.BLOCK:
+                L.frame += 1
+            case St.BUILD:
+                self._build(L)
+            case St.SHRUG:
+                L.frame += 1
+                if L.frame >= SHRUG_TICKS:
+                    self._set(L, St.WALK)
+            case St.BASH:
+                self._bash(L)
+            case St.MINE:
+                self._mine(L)
+            case St.DIG:
+                self._dig(L)
+            case St.OHNO:
+                L.frame += 1
+                if not self.terrain.solid(L.x, L.y):
+                    L.y += 1
+                if L.frame >= OHNO_TICKS:
+                    self._explode(L)
+            case St.SPLAT | St.DROWN | St.BURN:
+                L.frame += 1
+                limit = {St.SPLAT: SPLAT_TICKS, St.DROWN: DROWN_TICKS, St.BURN: BURN_TICKS}[L.state]
+                if L.frame >= limit:
+                    self._kill(L)
+            case St.EXIT:
+                L.frame += 1
+                if L.frame >= EXIT_TICKS:
+                    L.removed = True
+                    self.saved += 1
+                    self.events.append("yippee")
+
+    def _in_block_field(self, L: Lemming) -> bool:
+        for b in self.blockers:
+            if b is not L and abs(b.y - L.y) <= 8 and 0 < (b.x - L.x) * L.dir <= BLOCK_RANGE:
+                return True
+        return False
+
+    def _walk(self, L: Lemming) -> None:
+        t = self.terrain
+        if self._in_block_field(L):
+            L.dir = -L.dir
+        L.frame += 1
+        nx = L.x + L.dir
+        if t.solid(nx, L.y - 1):
+            h = 0
+            while h <= STEP_UP and t.solid(nx, L.y - 1 - h):
+                h += 1
+            if h > STEP_UP:  # muro
+                if L.climber and 0 <= nx < t.w:  # los bordes del mapa no se trepan
+                    self._set(L, St.CLIMB)
+                else:
+                    L.dir = -L.dir
+                return
+            L.x, L.y = nx, L.y - h
+        elif t.solid(nx, L.y):
+            L.x = nx
+        else:
+            L.x = nx
+            for d in range(1, STEP_DOWN + 1):
+                if t.solid(nx, L.y + d):
+                    L.y += d
+                    return
+            self._set(L, St.FALL)
+
+    def _land(self, L: Lemming, lethal: bool) -> None:
+        if lethal and L.fall > LETHAL_FALL:
+            self._set(L, St.SPLAT)
+            self.events.append("splat")
+        else:
+            self._set(L, St.WALK)
+
+    def _fall(self, L: Lemming) -> None:
+        t = self.terrain
+        L.frame += 1
+        if L.floater and L.frame > FLOAT_DELAY:
+            L.state = St.FLOAT
+            L.frame = 0
+            return
+        for _ in range(FALL_SPEED):
+            if t.solid(L.x, L.y):
+                break
+            L.y += 1
+            L.fall += 1
+        if t.solid(L.x, L.y):
+            self._land(L, True)
+
+    def _float(self, L: Lemming) -> None:
+        t = self.terrain
+        L.frame += 1
+        for _ in range(1 + (L.frame % 2)):
+            if t.solid(L.x, L.y):
+                break
+            L.y += 1
+        if t.solid(L.x, L.y):
+            self._land(L, False)
+
+    def _climb(self, L: Lemming) -> None:
+        t = self.terrain
+        L.frame += 1
+        if L.frame % 2:  # trepa medio píxel por tick
+            return
+        if t.solid(L.x, L.y - CLIMB_HEAD) or L.y < CLIMB_HEAD + 2:
+            L.dir = -L.dir
+            L.x += L.dir
+            self._set(L, St.FALL)
+            return
+        L.y -= 1
+        if not t.solid(L.x + L.dir, L.y - 1):
+            self._set(L, St.HOIST)
+
+    def _build(self, L: Lemming) -> None:
+        t = self.terrain
+        if self._in_block_field(L):
+            L.dir = -L.dir
+            self._set(L, St.WALK)
+            return
+        L.frame += 1
+        if L.frame < BRICK_TICKS:
+            return
+        L.frame = 0
+        t.add_row(L.x, L.x + 5 * L.dir, L.y - 1)
+        L.bricks -= 1
+        self.events.append("brick" if L.bricks >= 3 else "warn")
+        if t.solid(L.x + L.dir, L.y - 2) or t.solid(L.x + 2 * L.dir, L.y - 2) or t.solid(L.x, L.y - CLIMB_HEAD):
+            L.dir = -L.dir
+            self._set(L, St.WALK)
+            return
+        L.x += 2 * L.dir
+        L.y -= 1
+        if L.bricks <= 0:
+            self._set(L, St.SHRUG)
+
+    def _bash(self, L: Lemming) -> None:
+        t = self.terrain
+        if self._in_block_field(L):
+            L.dir = -L.dir
+            self._set(L, St.WALK)
+            return
+        L.frame = (L.frame + 1) % BASH_CYCLE
+        if L.frame not in BASH_MOVES:
+            return
+        mask = BASH_MASK if L.dir > 0 else BASH_MASK[:, ::-1]
+        x0 = L.x + 1 if L.dir > 0 else L.x - 5
+        ahead = np.ones((9, BASH_LOOKAHEAD), dtype=bool)
+        if not t.any_solid(L.x + 1 if L.dir > 0 else L.x - BASH_LOOKAHEAD, L.y - 9, ahead):
+            self._set(L, St.WALK)
+            return
+        if t.blocked(x0, L.y - 9, mask, L.dir):
+            self.events.append("ting")
+            L.dir = -L.dir
+            self._set(L, St.WALK)
+            return
+        t.erase(x0, L.y - 9, mask, L.dir)
+        L.x += L.dir
+        if not t.solid(L.x, L.y):
+            for d in range(1, STEP_DOWN + 1):
+                if t.solid(L.x, L.y + d):
+                    L.y += d
+                    return
+            self._set(L, St.FALL)
+
+    def _mine(self, L: Lemming) -> None:
+        t = self.terrain
+        if self._in_block_field(L):
+            L.dir = -L.dir
+            self._set(L, St.WALK)
+            return
+        L.frame += 1
+        if L.frame < MINE_TICKS:
+            return
+        L.frame = 0
+        mask = MINE_MASK if L.dir > 0 else MINE_MASK[:, ::-1]
+        x0 = L.x if L.dir > 0 else L.x - 5
+        if t.blocked(x0, L.y - 9, mask, L.dir):
+            self.events.append("ting")
+            L.dir = -L.dir
+            self._set(L, St.WALK)
+            return
+        t.erase(x0, L.y - 9, mask, L.dir)
+        L.x += 2 * L.dir
+        L.y += 1
+        if not t.solid(L.x, L.y):
+            self._set(L, St.FALL)
+
+    def _dig(self, L: Lemming) -> None:
+        t = self.terrain
+        L.frame += 1
+        if L.frame < DIG_TICKS:
+            return
+        L.frame = 0
+        if t.blocked(L.x - 4, L.y, DIG_MASK, 0):
+            self.events.append("ting")
+            self._set(L, St.WALK)
+            return
+        t.erase(L.x - 4, L.y, DIG_MASK, 0)
+        L.y += 1
+        if not t.solid(L.x, L.y):
+            self._set(L, St.FALL)
+
+    # ── muertes, salidas, explosiones ────────────────────────────────────
+    def _kill(self, L: Lemming) -> None:
+        if not L.removed:
+            L.removed = True
+            self.dead += 1
+
+    def _explode(self, L: Lemming) -> None:
+        r = BOMB_RADIUS
+        self.terrain.erase(L.x - r, L.y - 6 - r, BOMB_MASK, 0)
+        self.events.append("boom")
+        self._burst(L.x, L.y - 6, 40, None)
+        self._kill(L)
+
+    def _burst(self, x: float, y: float, n: int, color: tuple[int, int, int] | None) -> None:
+        rnd = self.rng.random((n, 4))
+        palette = [(255, 255, 255), (255, 220, 40), (255, 120, 30), (70, 90, 235), (40, 200, 40)]
+        for i in range(n):
+            ang = rnd[i, 0] * math.tau
+            sp = 1 + rnd[i, 1] * 3
+            c = color or palette[int(rnd[i, 2] * len(palette))]
+            self.particles.append([x, y, math.cos(ang) * sp, math.sin(ang) * sp - 2, c, 20 + int(rnd[i, 3] * 20)])
+
+    def _particles(self) -> None:
+        for p in self.particles:
+            p[0] += p[2]
+            p[1] += p[3]
+            p[3] += 0.35
+            p[5] -= 1
+        self.particles = [p for p in self.particles if p[5] > 0]
+
+    def _hazards(self, L: Lemming) -> None:
+        if L.state in DOOMED:
+            return
+        t = self.terrain
+        if L.y >= t.h + 8:
+            self._kill(L)
+            return
+        hy = L.y - 1
+        if 0 <= L.x < t.w and 0 <= hy < t.h:
+            hz = self.hazard[hy, L.x]
+            if hz == HZ_WATER:
+                L.bomb = None
+                self._set(L, St.DROWN)
+                self.events.append("drown")
+                return
+            if hz == HZ_FIRE:
+                L.bomb = None
+                self._set(L, St.BURN)
+                self.events.append("burn")
+                self._burst(L.x, L.y - 4, 12, (255, 150, 30))
+                return
+        if L.state in EXITABLE:
+            for e in self.exits:
+                if abs(L.x - e.x) <= 2 and e.y - 8 <= L.y <= e.y + 1:
+                    L.bomb = None
+                    self._set(L, St.EXIT)
+                    return
+        for tr in self.traps:
+            if tr.cool == 0 and tr.hits(L.x, L.y - 1):
+                tr.cool = TRAP_COOLDOWN
+                self.events.append("trap")
+                self._burst(L.x, L.y - 4, 20, (230, 230, 230))
+                self._kill(L)
+                return
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Autopiloto (soluciones de demostración) y repeticiones
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class Autopilot:
+    def __init__(self, rules: tuple[Rule, ...]):
+        self.rules = rules
+        self.left = [r.n for r in rules]
+        self.done_at: dict[int, int] = {}
+
+    def step(self, world: World, apply) -> None:
+        tracks = sorted({r.track for r in self.rules})
+        for tr in tracks:
+            prev = 0
+            for i, r in enumerate(self.rules):
+                if r.track != tr:
+                    continue
+                if self.left[i] <= 0:
+                    prev = self.done_at[i]
+                    continue
+                if world.tick_count >= prev + r.delay:
+                    self._try(i, r, world, apply)
+                    if self.left[i] <= 0:
+                        prev = self.done_at[i]
+                        continue
+                if self.left[i] > 0 and not r.par:
+                    break
+
+    def _try(self, i: int, r: Rule, world: World, apply) -> None:
+        if r.rr is not None:
+            apply(("rr", r.rr))
+            self.left[i] = 0
+            self.done_at[i] = world.tick_count
+            return
+        if r.skill is None or world.skills[r.skill] <= 0:
+            return
+        for L in world.lemmings:
+            if self.left[i] <= 0:
+                break
+            if L.removed or (r.state and L.state != r.state):
+                continue
+            if r.x is not None and abs(L.x - r.x) > r.win:
+                continue
+            if r.dir and L.dir != r.dir:
+                continue
+            if not r.y[0] <= L.y <= r.y[1]:
+                continue
+            if world.can_assign(L, r.skill) and apply(("assign", L.id, str(r.skill))):
+                self.left[i] -= 1
+                if self.left[i] <= 0:
+                    self.done_at[i] = world.tick_count
+
+
+class Replay:
+    def __init__(self, commands: list[list]):
+        self.cmds = sorted(commands, key=lambda c: c[0])
+        self.pos = 0
+
+    def step(self, world: World, apply) -> None:
+        while self.pos < len(self.cmds) and self.cmds[self.pos][0] <= world.tick_count:
+            apply(tuple(self.cmds[self.pos][1:]))
+            self.pos += 1
+
+
+def simulate(idx: int, pilot=None, max_minutes: int | None = None) -> tuple[World, list[list]]:
+    """Juega un nivel sin ventana. Devuelve el mundo final y las órdenes grabadas."""
+    world = World(LEVELS[idx])
+    log: list[list] = []
+
+    def apply(cmd: Command) -> bool:
+        ok = world.do(cmd)
+        if ok:
+            log.append([world.tick_count, *cmd])
+        return ok
+
+    limit = (max_minutes or LEVELS[idx].minutes) * 60 * TPS + 10
+    while not world.done and world.tick_count < limit:
+        if pilot:
+            pilot.step(world, apply)
+        world.tick()
+    return world, log
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. RENDER
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _surface_from_rows(rows: list[str]) -> pygame.Surface:
+    surf = pygame.Surface((len(rows[0]), len(rows)), pygame.SRCALPHA)
+    for y, row in enumerate(rows):
+        for x, ch in enumerate(row):
+            if ch != ".":
+                surf.set_at((x, y), PALETTE[ch])
+    return surf
+
+
+class Sprites:
+    def __init__(self) -> None:
+        self.right = {k: [_surface_from_rows(f) for f in v] for k, v in SPRITE_SRC.items()}
+        self.left = {k: [pygame.transform.flip(s, True, False) for s in v] for k, v in self.right.items()}
+        self.digits = {d: _surface_from_rows([r.replace("1", "W").replace("0", ".") for r in rows]) for d, rows in DIGITS.items()}
+
+    def get(self, name: str, i: int, d: int) -> pygame.Surface:
+        frames = (self.right if d > 0 else self.left)[name]
+        return frames[i % len(frames)]
+
+    def icon(self, skill: Skill) -> pygame.Surface:
+        name = {
+            Skill.CLIMBER: "climb", Skill.FLOATER: "float", Skill.BOMBER: "ohno", Skill.BLOCKER: "block",
+            Skill.BUILDER: "build", Skill.BASHER: "bash", Skill.MINER: "mine", Skill.DIGGER: "dig",
+        }[skill]
+        return self.right[name][0]
+
+
+def sprite_of(L: Lemming, tick: int) -> tuple[str, int, int]:
+    """(nombre, fotograma, desplazamiento vertical extra)."""
+    f = L.frame
+    match L.state:
+        case St.WALK:
+            return "walk", (tick + L.id) // 1, 0
+        case St.FALL:
+            return "fall", tick // 2, 0
+        case St.FLOAT:
+            return "float", tick // 4, 0
+        case St.CLIMB:
+            return "climb", L.y // 2, 0
+        case St.HOIST:
+            return "climb", 1, 0
+        case St.BLOCK:
+            return "block", tick // 6, 0
+        case St.BUILD:
+            return "build", 0 if f < BRICK_TICKS // 2 else 1, 0
+        case St.SHRUG:
+            return "shrug", 0, 0
+        case St.BASH:
+            return "bash", f // 4, 0
+        case St.MINE:
+            return "mine", 0 if f < MINE_TICKS // 2 else 1, 0
+        case St.DIG:
+            return "dig", tick // 2, 0
+        case St.OHNO:
+            return "ohno", tick // 2, 0
+        case St.SPLAT:
+            return "splat", min(2, f * 3 // SPLAT_TICKS), 0
+        case St.DROWN:
+            return "fall", tick // 2, f // 2
+        case St.BURN:
+            return "ohno", tick, 0
+        case St.EXIT:
+            return "fall", tick // 2, 0
+    return "walk", 0, 0
+
+
+def _overlay(mask: np.ndarray, colors: np.ndarray, alpha: int) -> pygame.Surface:
+    h, w = mask.shape
+    surf = pygame.Surface((w, h), pygame.SRCALPHA)
+    rgb = pygame.surfarray.pixels3d(surf)
+    a = pygame.surfarray.pixels_alpha(surf)
+    rgb[mask.T] = colors[mask]
+    a[mask.T] = alpha
+    del rgb, a
+    return surf
+
+
+class Renderer:
+    def __init__(self, world: World, sprites: Sprites):
+        self.world = world
+        self.sp = sprites
+        t = world.terrain
+        self.tsurf = pygame.Surface((t.w, t.h), depth=32)
+        self.sync()
+        hz = world.hazard
+        rng = np.random.default_rng(7)
+        water, fire = hz == HZ_WATER, hz == HZ_FIRE
+        self.water: list[pygame.Surface] = []
+        self.fire: list[pygame.Surface] = []
+        if water.any():
+            top = water.copy()
+            top[1:] &= ~water[:-1]
+            for k in range(2):
+                col = np.zeros((*hz.shape, 3))
+                col[:] = (30, 80, 210)
+                col[top] = (150, 200, 255)
+                xx = np.arange(hz.shape[1])
+                waves = np.zeros_like(top)
+                waves[1:] = top[:-1] & (((xx // 3 + k) % 2) == 0)[None, :]
+                col[waves & water] = (90, 140, 240)
+                self.water.append(_overlay(water, col.astype(np.uint8), 190))
+        if fire.any():
+            fire_pal = np.array([(200, 40, 0), (255, 130, 0), (255, 215, 60)], dtype=float)
+            for _ in range(3):
+                col = fire_pal[rng.integers(0, 3, hz.shape)]
+                self.fire.append(_overlay(fire, col.astype(np.uint8), 230))
+        self.mini: pygame.Surface | None = None
+        self.mini_age = 999
+
+    def sync(self) -> None:
+        t = self.world.terrain
+        if t.dirty is None:
+            return
+        x0, y0, x1, y1 = t.dirty
+        solid = t.k[y0:y1, x0:x1] != AIR
+        img = np.where(solid[..., None], t.c[y0:y1, x0:x1], t.bg[y0:y1, x0:x1])
+        px = pygame.surfarray.pixels3d(self.tsurf)
+        px[x0:x1, y0:y1] = img.transpose(1, 0, 2)
+        del px
+        t.dirty = None
+        self.mini_age = 999
+
+    def minimap(self, size: tuple[int, int]) -> pygame.Surface:
+        self.mini_age += 1
+        if self.mini is None or self.mini_age > 20:
+            self.mini = pygame.transform.smoothscale(self.tsurf, size)
+            self.mini_age = 0
+        return self.mini
+
+    def draw(self, view: pygame.Surface, cam: int, frame: int) -> None:
+        w = self.world
+        self.sync()
+        view.blit(self.tsurf, (0, 0), pygame.Rect(cam, 0, VIEW_W, VIEW_H))
+        for e in w.entrances:
+            self._hatch(view, e.x - cam, e.y, min(1.0, w.hatch / HATCH_TICKS))
+        for ex in w.exits:
+            self._exit(view, ex.x - cam, ex.y, frame)
+        for tr in w.traps:
+            self._trap(view, tr, cam)
+        for L in w.lemmings:
+            if L.removed:
+                continue
+            name, i, dy = sprite_of(L, w.tick_count)
+            img = self.sp.get(name, i, L.dir)
+            ax = 3 if L.dir > 0 else 4
+            view.blit(img, (L.x - ax - cam, L.y - img.get_height() + dy))
+            if L.bomb is not None:
+                d = str(min(5, math.ceil(L.bomb / TPS)))
+                view.blit(self.sp.digits[d], (L.x - 1 - cam, L.y - 17))
+            if L.state == St.BUILD and L.bricks <= 3 and frame % 16 < 8:
+                view.fill((255, 225, 40), (L.x - cam, L.y - 14, 1, 2))
+        for p in w.particles:
+            view.fill(p[4], (int(p[0]) - cam, int(p[1]), 1, 1))
+        if self.water:
+            view.blit(self.water[(frame // 20) % len(self.water)], (0, 0), pygame.Rect(cam, 0, VIEW_W, VIEW_H))
+        if self.fire:
+            view.blit(self.fire[(frame // 5) % len(self.fire)], (0, 0), pygame.Rect(cam, 0, VIEW_W, VIEW_H))
+
+    @staticmethod
+    def _hatch(view: pygame.Surface, x: int, y: int, opened: float) -> None:
+        pygame.draw.rect(view, (90, 55, 30), (x - 11, y - 12, 22, 6))
+        pygame.draw.rect(view, (140, 95, 50), (x - 11, y - 12, 22, 2))
+        pygame.draw.rect(view, (20, 10, 5), (x - 8, y - 6, 16, 2))
+        ang = opened * 1.35
+        for side in (-1, 1):
+            hx = x + side * 8
+            ex = hx - side * int(8 * math.cos(ang))
+            ey = y - 6 + int(8 * math.sin(ang))
+            pygame.draw.line(view, (170, 120, 60), (hx, y - 6), (ex, ey), 2)
+
+    @staticmethod
+    def _exit(view: pygame.Surface, x: int, y: int, frame: int) -> None:
+        stone, dark = (150, 140, 120), (10, 5, 15)
+        pygame.draw.rect(view, dark, (x - 6, y - 14, 12, 14))
+        pygame.draw.rect(view, stone, (x - 9, y - 16, 3, 16))
+        pygame.draw.rect(view, stone, (x + 6, y - 16, 3, 16))
+        pygame.draw.rect(view, (185, 175, 150), (x - 11, y - 19, 22, 4))
+        for tx in (x - 9, x + 7):
+            for k in range(3):
+                c = (255, 230, 60) if (frame // 4 + k + tx) % 3 == 0 else (255, 110, 20)
+                view.fill(c, (tx + (k % 2), y - 21 - k - (frame // 6 + k) % 2, 1, 1))
+
+    @staticmethod
+    def _trap(view: pygame.Surface, tr: Trap, cam: int) -> None:
+        x, y = tr.x - cam, tr.y
+        drop = 0 if tr.cool == 0 else max(0, 6 - abs(TRAP_COOLDOWN - tr.cool - 6))
+        pygame.draw.rect(view, (90, 90, 100), (x, y - 10, 1, 18))
+        pygame.draw.rect(view, (90, 90, 100), (x + 7, y - 10, 1, 18))
+        pygame.draw.rect(view, (200, 200, 210), (x + 1, y - 9 + drop, 6, 5))
+        pygame.draw.rect(view, (230, 50, 50), (x + 1, y - 5 + drop, 6, 1))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Sonido sintetizado (sin muestras externas)
+# ═══════════════════════════════════════════════════════════════════════════
+
+SR = 22050
+
+
+def _env(n: int, decay: float) -> np.ndarray:
+    return np.exp(-np.linspace(0, decay, n))
+
+
+def _tone(freq: float | np.ndarray, dur: float, wave: str = "square", decay: float = 3.0) -> np.ndarray:
+    n = int(SR * dur)
+    f = np.broadcast_to(np.asarray(freq, dtype=float), (n,))
+    phase = np.cumsum(f) / SR
+    match wave:
+        case "square":
+            sig = np.sign(np.sin(phase * math.tau))
+        case "tri":
+            sig = 2 * np.abs(2 * (phase % 1) - 1) - 1
+        case _:
+            sig = np.sin(phase * math.tau)
+    return sig * _env(n, decay)
+
+
+def _noise(dur: float, decay: float, rng: np.random.Generator, smooth: int = 1) -> np.ndarray:
+    n = int(SR * dur)
+    x = rng.uniform(-1, 1, n)
+    if smooth > 1:
+        x = np.convolve(x, np.ones(smooth) / smooth, mode="same") * math.sqrt(smooth)
+    return x * _env(n, decay)
+
+
+def _sweep(f0: float, f1: float, dur: float) -> np.ndarray:
+    return np.linspace(f0, f1, int(SR * dur))
+
+
+NOTE = {n: i for i, n in enumerate(["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"])}
+
+
+def _freq(name: str) -> float:
+    return 440.0 * 2 ** ((NOTE[name[:-1]] + 12 * (int(name[-1]) + 1) - 69) / 12)
+
+
+# Melodía original (no es ninguna de las del juego de 1991).
+MELODY = (
+    "E5 G5 C6 G5 A5 G5 E5 C5 D5 F5 A5 F5 G5 - - - "
+    "E5 G5 C6 G5 A5 C6 B5 A5 G5 E5 D5 E5 C5 - - - "
+    "A4 C5 E5 C5 D5 F5 E5 D5 C5 E5 G5 E5 F5 E5 D5 - "
+    "E5 G5 C6 G5 A5 G5 E5 C5 D5 G5 F5 D5 C5 - C5 -"
+).split()
+BASS = "C3 C3 G2 G2 F2 F2 G2 G2 C3 C3 F2 G2 C3 C3 G2 G2 A2 A2 D3 D3 C3 C3 F2 F2 C3 C3 F2 F2 G2 G2 C3 C3".split()
+
+
+class Sfx:
+    def __init__(self, enabled: bool):
+        self.ok = False
+        self.music_on = enabled
+        self.sounds: dict[str, pygame.mixer.Sound] = {}
+        if not enabled:
+            return
+        try:
+            pygame.mixer.init(SR, -16, 2, 512)
+            init = pygame.mixer.get_init()
+        except pygame.error:
+            return
+        if not init:
+            return
+        self.channels = init[2]
+        rng = np.random.default_rng(3)
+        lib = {
+            "assign": _tone(1320, 0.05, decay=4),
+            "letsgo": _tone(_sweep(330, 880, 0.18), 0.18, decay=1.5),
+            "door": _noise(0.25, 6, rng, 30),
+            "splat": _noise(0.18, 8, rng, 6),
+            "boom": _noise(0.6, 5, rng, 3) * 1.4,
+            "yippee": np.concatenate([_tone(880, 0.06), _tone(1175, 0.08)]),
+            "ting": _tone(2100, 0.25, "sine", 6),
+            "drown": _tone(_sweep(500, 120, 0.4) * (1 + 0.1 * np.sin(np.arange(int(SR * 0.4)) / 300)), 0.4, "sine", 2),
+            "burn": _noise(0.3, 4, rng, 2),
+            "ohno": _tone(_sweep(700, 300, 0.3), 0.3, decay=1),
+            "brick": _tone(500, 0.03, decay=8) * 0.6,
+            "warn": _tone(1000, 0.05, decay=2),
+            "trap": np.concatenate([_noise(0.08, 2, rng, 1), _tone(90, 0.2, decay=4)]),
+            "click": _tone(800, 0.02, decay=6) * 0.5,
+        }
+        self.sounds = {k: self._make(v * 0.35) for k, v in lib.items()}
+        self.music = self._make(self._compose() * 0.18)
+        self.ok = True
+
+    def _make(self, mono: np.ndarray) -> pygame.mixer.Sound:
+        a = (np.clip(mono, -1, 1) * 32767).astype(np.int16)
+        if self.channels == 2:
+            a = np.column_stack([a, a])
+        return pygame.sndarray.make_sound(np.ascontiguousarray(a))
+
+    @staticmethod
+    def _compose() -> np.ndarray:
+        step = 0.17
+        n = int(SR * step)
+        out = np.zeros(n * len(MELODY))
+        for i, note in enumerate(MELODY):
+            if note != "-":
+                out[i * n : (i + 1) * n] += _tone(_freq(note), step, "square", 2.5)[:n] * 0.45
+        for i, note in enumerate(BASS):
+            s = i * 2 * n
+            tone = _tone(_freq(note), step * 2, "tri", 1.2)[: len(out) - s]
+            out[s : s + len(tone)] += tone * 0.8
+        return out
+
+    def play(self, name: str) -> None:
+        if self.ok and name in self.sounds:
+            self.sounds[name].play()
+
+    def start_music(self) -> None:
+        if self.ok and self.music_on:
+            self.music.play(-1)
+
+    def stop_music(self) -> None:
+        if self.ok:
+            self.music.stop()
+
+    def toggle_music(self, playing: bool) -> None:
+        self.music_on = not self.music_on
+        if self.music_on and playing:
+            self.start_music()
+        else:
+            self.stop_music()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. INTERFAZ
+# ═══════════════════════════════════════════════════════════════════════════
+
+BTN_W = 20
+BTN_RR_DOWN, BTN_RR_UP, BTN_PAUSE, BTN_NUKE = 0, 1, 10, 11
+MINI = pygame.Rect(242, VIEW_H + 11, 76, 28)
+PROGRESS_FILE = Path.home() / ".pylemmings.json"
+
+UI_BG = (18, 16, 30)
+UI_FG = (235, 235, 245)
+UI_DIM = (120, 115, 140)
+UI_ACC = (90, 220, 90)
+UI_BAD = (240, 90, 80)
+
+
+def load_progress() -> int:
+    try:
+        return int(json.loads(PROGRESS_FILE.read_text())["unlocked"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0
+
+
+def save_progress(unlocked: int) -> None:
+    try:
+        PROGRESS_FILE.write_text(json.dumps({"unlocked": unlocked}))
+    except OSError:
+        pass
+
+
+def fmt_time(ticks: int) -> str:
+    s = max(0, ticks) // TPS
+    return f"{s // 60}-{s % 60:02d}"
+
+
+@dataclass
+class PlayState:
+    idx: int
+    world: World
+    renderer: Renderer
+    cam: int = 0
+    skill: Skill = Skill.CLIMBER
+    paused: bool = False
+    ff: bool = False
+    acc: float = 0.0
+    log: list[list] = field(default_factory=list)
+    pilot: Autopilot | Replay | None = None
+    demo: bool = False
+    nuke_armed: int = 0
+    rr_hold: int = 0
+    hold_t: int = 0
+    end_wait: float = 0.0
+    aborted: bool = False
+
+
+class App:
+    def __init__(self, args: argparse.Namespace):
+        pygame.init()
+        info = pygame.display.Info()
+        s = max(1, args.scale)
+        if info.current_w > 0 and info.current_h > 0:
+            fit = min(info.current_w // VIEW_W, (info.current_h - 80) // (VIEW_H + PANEL_H))
+            s = max(1, min(s, fit))
+        self.s = s
+        self.screen = pygame.display.set_mode((VIEW_W * s, (VIEW_H + PANEL_H) * s))
+        pygame.display.set_caption("pylemmings")
+        self.clock = pygame.time.Clock()
+        self.view = pygame.Surface((VIEW_W, VIEW_H))
+        self.f_title = pygame.font.Font(None, 30 * s)
+        self.f_big = pygame.font.Font(None, 16 * s)
+        self.f_med = pygame.font.Font(None, 11 * s)
+        self.f_small = pygame.font.Font(None, 9 * s)
+        self.sprites = Sprites()
+        self.icons = {
+            k: pygame.transform.scale(self.sprites.icon(k), (8 * s, self.sprites.icon(k).get_height() * s)) for k in SKILLS
+        }
+        self.sfx = Sfx(not args.mute)
+        self.unlocked = len(LEVELS) - 1 if args.all else min(load_progress(), len(LEVELS) - 1)
+        self.sel = self.unlocked
+        self.mode = "menu"
+        self.frame = 0
+        self.p: PlayState | None = None
+        self.preview: tuple[int, World, Renderer] | None = None
+        self.result: dict | None = None
+        if args.replay:
+            data = json.loads(Path(args.replay).read_text())
+            self.start_play(int(data["level"]), pilot=Replay(data["commands"]), demo=True)
+        elif args.demo:
+            self.start_play(args.demo - 1, pilot=Autopilot(LEVELS[args.demo - 1].solution), demo=True)
+        elif args.level:
+            self.open_preview(args.level - 1)
+
+    # ── utilidades de dibujo ─────────────────────────────────────────────
+    def R(self, x: float, y: float, w: float, h: float) -> pygame.Rect:
+        s = self.s
+        return pygame.Rect(int(x * s), int(y * s), int(w * s), int(h * s))
+
+    def text(self, msg: str, font: pygame.font.Font, pos: tuple[float, float], color=UI_FG, center: bool = False) -> None:
+        img = font.render(msg, True, color)
+        x, y = pos[0] * self.s, pos[1] * self.s
+        if center:
+            x -= img.get_width() / 2
+        self.screen.blit(img, (x, y))
+
+    # ── transiciones ─────────────────────────────────────────────────────
+    def open_preview(self, idx: int) -> None:
+        w = World(LEVELS[idx])
+        self.preview = (idx, w, Renderer(w, self.sprites))
+        self.mode = "preview"
+
+    def start_play(self, idx: int, pilot=None, demo: bool = False) -> None:
+        if self.preview and self.preview[0] == idx and pilot is None:
+            _, w, r = self.preview
+        else:
+            w = World(LEVELS[idx])
+            r = Renderer(w, self.sprites)
+        self.preview = None
+        cam = w.entrances[0].x - VIEW_W // 2 if w.entrances else 0
+        self.p = PlayState(idx, w, r, cam=self._clamp_cam(w, cam), pilot=pilot, demo=demo)
+        self.p.skill = next((k for k in SKILLS if w.skills[k] > 0), Skill.CLIMBER)
+        self.mode = "play"
+        self.sfx.play("door")
+        self.sfx.start_music()
+
+    def finish_play(self) -> None:
+        p = self.p
+        assert p is not None
+        w = p.world
+        ok = w.success and not p.aborted
+        if ok and not p.demo and p.idx + 1 > self.unlocked and p.idx + 1 < len(LEVELS):
+            self.unlocked = p.idx + 1
+            save_progress(self.unlocked)
+        self.result = {"idx": p.idx, "saved": w.saved, "total": w.total, "need": w.level.to_save, "ok": ok,
+                       "log": p.log, "demo": p.demo, "saved_file": None}
+        self.sfx.stop_music()
+        self.mode = "result"
+
+    @staticmethod
+    def _clamp_cam(w: World, cam: int) -> int:
+        return max(0, min(cam, w.terrain.w - VIEW_W))
+
+    # ── bucle ────────────────────────────────────────────────────────────
+    def run(self) -> None:
+        while True:
+            dt = self.clock.tick(60)
+            self.frame += 1
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    return
+                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_m:
+                    self.sfx.toggle_music(self.mode == "play")
+                    continue
+                if getattr(self, f"on_{self.mode}")(ev) == "quit":
+                    return
+            if self.mode == "play":
+                self.update_play(dt)
+            self.screen.fill(UI_BG)
+            getattr(self, f"draw_{self.mode}")()
+            pygame.display.flip()
+
+    # ── menú ─────────────────────────────────────────────────────────────
+    def on_menu(self, ev: pygame.event.Event):
+        if ev.type == pygame.KEYDOWN:
+            if ev.key == pygame.K_ESCAPE:
+                return "quit"
+            if ev.key in (pygame.K_UP, pygame.K_w):
+                self.sel = (self.sel - 1) % len(LEVELS)
+            elif ev.key in (pygame.K_DOWN, pygame.K_s):
+                self.sel = (self.sel + 1) % len(LEVELS)
+            elif ev.key in (pygame.K_RETURN, pygame.K_SPACE) and self.sel <= self.unlocked:
+                self.open_preview(self.sel)
+            elif ev.key == pygame.K_d and self.sel <= self.unlocked:
+                self.start_play(self.sel, pilot=Autopilot(LEVELS[self.sel].solution), demo=True)
+        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            row = int((ev.pos[1] / self.s - 62) // 10)
+            if 0 <= row < len(LEVELS) and row <= self.unlocked:
+                if row == self.sel:
+                    self.open_preview(row)
+                self.sel = row
+        return None
+
+    def draw_menu(self) -> None:
+        self.text("PYLEMMINGS", self.f_title, (VIEW_W / 2, 10), UI_ACC, center=True)
+        self.text("Homenaje en Python a Lemmings (DMA Design, 1991)", self.f_small, (VIEW_W / 2, 40), UI_DIM, center=True)
+        for i, lv in enumerate(LEVELS):
+            y = 62 + i * 10
+            locked = i > self.unlocked
+            color = UI_DIM if locked else (UI_FG if i != self.sel else (255, 225, 40))
+            mark = ">" if i == self.sel else " "
+            label = f"{mark} {i + 1:2d}. {lv.name}" + ("   (bloqueado)" if locked else "")
+            self.text(label, self.f_med, (60, y), color)
+        self.text("Flechas: elegir  ·  Enter: jugar  ·  D: demo  ·  M: música  ·  Esc: salir",
+                  self.f_small, (VIEW_W / 2, 172), UI_DIM, center=True)
+        x = (self.frame // 2) % (VIEW_W + 40) - 20
+        img = pygame.transform.scale(self.sprites.get("walk", self.frame // 4, 1), (8 * self.s, 10 * self.s))
+        self.screen.blit(img, (x * self.s, 184 * self.s))
+
+    # ── previa del nivel ─────────────────────────────────────────────────
+    def on_preview(self, ev: pygame.event.Event):
+        assert self.preview is not None
+        if ev.type == pygame.KEYDOWN:
+            if ev.key == pygame.K_ESCAPE:
+                self.mode = "menu"
+            elif ev.key in (pygame.K_RETURN, pygame.K_SPACE):
+                self.start_play(self.preview[0])
+        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            self.start_play(self.preview[0])
+        return None
+
+    def draw_preview(self) -> None:
+        assert self.preview is not None
+        idx, w, r = self.preview
+        lv = w.level
+        r.sync()
+        mw = min(300, w.terrain.w * 60 // VIEW_H)
+        mini = pygame.transform.smoothscale(r.tsurf, (mw * self.s, 60 * self.s))
+        self.screen.blit(mini, ((VIEW_W - mw) / 2 * self.s, 8 * self.s))
+        self.text(f"Nivel {idx + 1}: {lv.name}", self.f_big, (VIEW_W / 2, 76), (255, 225, 40), center=True)
+        self.text(lv.hint, self.f_med, (VIEW_W / 2, 92), UI_DIM, center=True)
+        pct = round(100 * lv.to_save / lv.lemmings)
+        self.text(f"{lv.lemmings} lemmings  ·  rescatar {lv.to_save} ({pct} %)", self.f_med, (VIEW_W / 2, 108), center=True)
+        self.text(f"Tasa de salida {lv.rr}  ·  Tiempo {lv.minutes} min", self.f_med, (VIEW_W / 2, 120), center=True)
+        skills = [f"{SKILL_NAMES[k]} {lv.skills[k]}" for k in SKILLS if lv.skills.get(k)]
+        for row in range(0, len(skills), 4):
+            self.text("  ·  ".join(skills[row : row + 4]), self.f_small, (VIEW_W / 2, 136 + row / 4 * 10), UI_ACC, center=True)
+        self.text("Clic o Enter para empezar  ·  Esc: volver", self.f_small, (VIEW_W / 2, 182), UI_DIM, center=True)
+
+    # ── partida ──────────────────────────────────────────────────────────
+    def apply(self, cmd: Command) -> bool:
+        p = self.p
+        assert p is not None
+        ok = p.world.do(cmd)
+        if ok:
+            p.log.append([p.world.tick_count, *cmd])
+        self.drain_events()
+        return ok
+
+    def drain_events(self) -> None:
+        assert self.p is not None
+        ev = self.p.world.events
+        for name in dict.fromkeys(ev):  # sin repetir el mismo sonido en un tick
+            self.sfx.play(name)
+        ev.clear()
+
+    def world_mouse(self) -> tuple[int, int, bool]:
+        assert self.p is not None
+        mx, my = pygame.mouse.get_pos()
+        x, y = mx // self.s, my // self.s
+        return x + self.p.cam, y, y < VIEW_H
+
+    def on_play(self, ev: pygame.event.Event):
+        p = self.p
+        assert p is not None
+        w = p.world
+        if ev.type == pygame.KEYDOWN:
+            k = ev.key
+            if k == pygame.K_ESCAPE:
+                p.aborted = True
+                self.finish_play()
+            elif k in (pygame.K_SPACE, pygame.K_p):
+                p.paused = not p.paused
+            elif k == pygame.K_f:
+                p.ff = not p.ff
+            elif k == pygame.K_n:
+                self.press_nuke()
+            elif pygame.K_1 <= k <= pygame.K_8:
+                p.skill = SKILLS[k - pygame.K_1]
+                self.sfx.play("click")
+            elif k in (pygame.K_PLUS, pygame.K_KP_PLUS, pygame.K_EQUALS, pygame.K_F2):
+                if not p.demo:
+                    self.apply(("rr", w.rr + 5))
+            elif k in (pygame.K_MINUS, pygame.K_KP_MINUS, pygame.K_F1):
+                if not p.demo:
+                    self.apply(("rr", w.rr - 5))
+        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            mx, my = ev.pos[0] / self.s, ev.pos[1] / self.s
+            if my < VIEW_H:
+                if not p.demo:
+                    x, y, _ = self.world_mouse()
+                    best, _ = w.pick(x, y, p.skill)
+                    if best is not None:
+                        self.apply(("assign", best.id, str(p.skill)))
+            elif MINI.collidepoint(mx, my):
+                self.minimap_jump(mx)
+            elif my >= VIEW_H + 10:
+                self.press_button(int(mx // BTN_W))
+        elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+            p.rr_hold = 0
+        elif ev.type == pygame.MOUSEMOTION and ev.buttons[0]:
+            mx, my = ev.pos[0] / self.s, ev.pos[1] / self.s
+            if MINI.collidepoint(mx, my):
+                self.minimap_jump(mx)
+        elif ev.type == pygame.MOUSEWHEEL:
+            p.cam = self._clamp_cam(w, p.cam - (ev.y - ev.x) * 16)
+        return None
+
+    def press_nuke(self) -> None:
+        p = self.p
+        assert p is not None
+        if p.demo:
+            return
+        if p.nuke_armed > 0:
+            self.apply(("nuke",))
+            p.nuke_armed = 0
+        else:
+            p.nuke_armed = 60
+
+    def press_button(self, i: int) -> None:
+        p = self.p
+        assert p is not None
+        if i in (BTN_RR_DOWN, BTN_RR_UP):
+            if not p.demo:
+                p.rr_hold = -1 if i == BTN_RR_DOWN else 1
+                p.hold_t = 0
+                self.apply(("rr", p.world.rr + p.rr_hold))
+        elif 2 <= i <= 9:
+            p.skill = SKILLS[i - 2]
+            self.sfx.play("click")
+        elif i == BTN_PAUSE:
+            p.paused = not p.paused
+        elif i == BTN_NUKE:
+            self.press_nuke()
+
+    def minimap_jump(self, mx: float) -> None:
+        p = self.p
+        assert p is not None
+        frac = (mx - MINI.x) / MINI.w
+        p.cam = self._clamp_cam(p.world, int(frac * p.world.terrain.w - VIEW_W / 2))
+
+    def update_play(self, dt: int) -> None:
+        p = self.p
+        assert p is not None
+        w = p.world
+        keys = pygame.key.get_pressed()
+        speed = 8 if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else 4
+        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+            p.cam -= speed
+        if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+            p.cam += speed
+        if pygame.mouse.get_focused():
+            mx, my = pygame.mouse.get_pos()
+            if my < VIEW_H * self.s:
+                if mx < 3 * self.s:
+                    p.cam -= speed
+                elif mx > (VIEW_W - 3) * self.s:
+                    p.cam += speed
+        p.cam = self._clamp_cam(w, p.cam)
+        if p.nuke_armed > 0:
+            p.nuke_armed -= 1
+        if p.rr_hold:
+            p.hold_t += 1
+            if p.hold_t > 12 and p.hold_t % 3 == 0:
+                self.apply(("rr", w.rr + p.rr_hold))
+        if w.done:
+            p.end_wait += dt
+            if p.end_wait > 1500:
+                self.finish_play()
+            return
+        if p.paused:
+            return
+        p.acc = min(p.acc + dt, 250)
+        while p.acc >= TICK_MS:
+            p.acc -= TICK_MS
+            for _ in range(4 if p.ff else 1):
+                if w.done:
+                    break
+                if p.pilot:
+                    p.pilot.step(w, self.apply)
+                w.tick()
+                self.drain_events()
+
+    def draw_play(self) -> None:
+        p = self.p
+        assert p is not None
+        w = p.world
+        p.renderer.draw(self.view, p.cam, self.frame)
+        x, y, inside = self.world_mouse()
+        hover, count = w.pick(x, y, p.skill) if inside else (None, 0)
+        if inside:
+            vx = x - p.cam
+            if hover is not None:
+                pygame.draw.rect(self.view, (255, 255, 255), (hover.x - 5 - p.cam, hover.y - 12, 11, 13), 1)
+            else:
+                pygame.draw.line(self.view, (255, 255, 255), (vx - 4, y), (vx - 2, y))
+                pygame.draw.line(self.view, (255, 255, 255), (vx + 2, y), (vx + 4, y))
+                pygame.draw.line(self.view, (255, 255, 255), (vx, y - 4), (vx, y - 2))
+                pygame.draw.line(self.view, (255, 255, 255), (vx, y + 2), (vx, y + 4))
+        pygame.mouse.set_visible(not inside)
+        self.screen.blit(pygame.transform.scale(self.view, (VIEW_W * self.s, VIEW_H * self.s)), (0, 0))
+        self.draw_panel(hover, count)
+
+    def draw_panel(self, hover: Lemming | None, count: int) -> None:
+        p = self.p
+        assert p is not None
+        w = p.world
+        s = self.s
+        top = VIEW_H
+        pygame.draw.rect(self.screen, (28, 24, 44), self.R(0, top, VIEW_W, PANEL_H))
+        status = ""
+        if hover is not None:
+            tag = STATE_NAMES[hover.state]
+            if hover.climber and hover.floater:
+                tag += " (atleta)"
+            status = f"{tag} {count}"
+        pct = round(100 * w.saved / w.total)
+        info = f"Fuera {w.alive}   Dentro {pct} %   Tiempo {fmt_time(w.time_left)}"
+        if p.demo:
+            status = "DEMO  " + status
+        if p.paused:
+            info = "PAUSA   " + info
+        elif p.ff:
+            info = ">> " + info
+        self.text(status, self.f_small, (3, top + 1.5), (255, 225, 40))
+        self.text(info, self.f_small, (VIEW_W - 3 - self.f_small.size(info)[0] / s, top + 1.5), UI_ACC)
+        for i in range(12):
+            rect = self.R(i * BTN_W + 0.5, top + 10.5, BTN_W - 1, 29)
+            selected = 2 <= i <= 9 and SKILLS[i - 2] == p.skill
+            pygame.draw.rect(self.screen, (55, 48, 85) if not selected else (110, 95, 170), rect)
+            pygame.draw.rect(self.screen, (255, 255, 255) if selected else (85, 75, 120), rect, max(1, s // 2))
+            cx = i * BTN_W + BTN_W / 2
+            num = ""
+            if i == BTN_RR_DOWN:
+                num = str(w.rr_min)
+                self.text("-", self.f_big, (cx, top + 21), UI_FG, center=True)
+            elif i == BTN_RR_UP:
+                num = str(w.rr)
+                self.text("+", self.f_big, (cx, top + 21), UI_FG, center=True)
+            elif 2 <= i <= 9:
+                k = SKILLS[i - 2]
+                num = str(w.skills[k]) if w.skills[k] else ""
+                icon = self.icons[k]
+                self.screen.blit(icon, (int(cx * s - icon.get_width() / 2), int((top + 39) * s - icon.get_height())))
+            elif i == BTN_PAUSE:
+                pygame.draw.rect(self.screen, UI_FG, self.R(cx - 4, top + 22, 3, 10))
+                pygame.draw.rect(self.screen, UI_FG, self.R(cx + 1, top + 22, 3, 10))
+            elif i == BTN_NUKE:
+                col = UI_BAD if p.nuke_armed % 10 < 5 or not p.nuke_armed else UI_FG
+                pygame.draw.circle(self.screen, col, (int(cx * s), int((top + 24) * s)), int(5 * s))
+                pygame.draw.rect(self.screen, col, self.R(cx - 1.5, top + 27, 3, 7))
+            if num:
+                self.text(num, self.f_small, (cx, top + 11.5), UI_FG, center=True)
+        mini = p.renderer.minimap((MINI.w * s, MINI.h * s))
+        self.screen.blit(mini, (MINI.x * s, MINI.y * s))
+        fx, fy = MINI.w / w.terrain.w, MINI.h / w.terrain.h
+        for L in w.lemmings:
+            self.screen.fill(UI_ACC, self.R(MINI.x + L.x * fx, MINI.y + (L.y - 4) * fy, 1, 1))
+        pygame.draw.rect(self.screen, (255, 255, 255), self.R(MINI.x + p.cam * fx, MINI.y, VIEW_W * fx, MINI.h), 1)
+
+    # ── resultado ────────────────────────────────────────────────────────
+    def on_result(self, ev: pygame.event.Event):
+        r = self.result
+        assert r is not None
+        if ev.type != pygame.KEYDOWN and not (ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1):
+            return None
+        key = getattr(ev, "key", pygame.K_RETURN)
+        if key == pygame.K_ESCAPE:
+            self.sel = min(self.unlocked, r["idx"] + (1 if r["ok"] else 0))
+            self.mode = "menu"
+        elif key == pygame.K_r and not r["demo"]:
+            path = Path.cwd() / f"pylemmings_nivel{r['idx'] + 1:02d}.json"
+            try:
+                path.write_text(json.dumps({"level": r["idx"], "commands": r["log"]}))
+                r["saved_file"] = path.name
+            except OSError as exc:
+                r["saved_file"] = f"error: {exc}"
+        elif key in (pygame.K_RETURN, pygame.K_SPACE):
+            nxt = r["idx"] + 1 if r["ok"] and not r["demo"] else r["idx"]
+            if nxt >= len(LEVELS):
+                self.mode = "menu"
+            else:
+                self.sel = nxt
+                self.open_preview(nxt)
+        return None
+
+    def draw_result(self) -> None:
+        r = self.result
+        assert r is not None
+        pct = round(100 * r["saved"] / r["total"])
+        need = round(100 * r["need"] / r["total"])
+        if r["saved"] == r["total"]:
+            msg = "¡Perfecto! Ni un solo lemming perdido."
+        elif r["ok"]:
+            msg = "¡Lo has conseguido!"
+        elif r["saved"] == 0:
+            msg = "Ninguno se ha salvado. Duro oficio, el de pastor."
+        elif r["saved"] == r["need"] - 1:
+            msg = "¡Por uno! Casi lo tienes."
+        else:
+            msg = "Te han faltado lemmings. Otra vez."
+        last = r["ok"] and r["idx"] == len(LEVELS) - 1 and not r["demo"]
+        if last:
+            msg = "¡Has completado pylemmings! Las criaturas te lo agradecen."
+        self.text(f"Nivel {r['idx'] + 1}: {LEVELS[r['idx']].name}", self.f_big, (VIEW_W / 2, 30), (255, 225, 40), center=True)
+        self.text(f"Has rescatado el {pct} %", self.f_big, (VIEW_W / 2, 62), UI_ACC if r["ok"] else UI_BAD, center=True)
+        self.text(f"Necesitabas el {need} %  ·  {r['saved']} de {r['total']} (mínimo {r['need']})", self.f_med, (VIEW_W / 2, 82), center=True)
+        self.text(msg, self.f_med, (VIEW_W / 2, 104), center=True)
+        nxt = "siguiente nivel" if r["ok"] and not r["demo"] and not last else "reintentar"
+        line = f"Enter: {nxt}  ·  Esc: menú"
+        if not r["demo"]:
+            line += "  ·  R: guardar repetición"
+        self.text(line, self.f_small, (VIEW_W / 2, 170), UI_DIM, center=True)
+        if r["saved_file"]:
+            self.text(f"Guardado: {r['saved_file']}", self.f_small, (VIEW_W / 2, 182), UI_DIM, center=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 10. SELFTEST (sin ventana)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _lab(width: int = 120, floor: int = 120) -> World:
+    """Mundo de laboratorio: suelo plano, sin entradas."""
+    lv = Level("lab", "", 0, 0, 50, 1, {s: 99 for s in SKILLS}, "tierra", ("." * (width // CELL),))
+    w = World(lv)
+    w.terrain.k[floor:, :] = DIRT
+    return w
+
+
+def _put(w: World, x: int, y: int, state: St = St.WALK, d: int = 1) -> Lemming:
+    L = Lemming(len(w.lemmings), x, y, d, state)
+    w.lemmings.append(L)
+    w.by_id[L.id] = L
+    return L
+
+
+def _run(w: World, n: int) -> None:
+    for _ in range(n):
+        w.tick()
+
+
+def selftest() -> int:
+    fails = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal fails
+        print(f"  [{'ok' if cond else 'FALLO'}] {name}" + (f"  ({detail})" if detail and not cond else ""))
+        fails += not cond
+
+    print("Física:")
+    for h, passes in ((6, True), (7, False)):
+        w = _lab()
+        w.terrain.k[120 - h : 120, 40:80] = DIRT
+        L = _put(w, 30, 120)
+        _run(w, 20)
+        ok = (L.x > 40 and L.y == 120 - h) if passes else (L.dir == -1 and L.x < 40)
+        check(f"escalón de {h} px {'se sube' if passes else 'es un muro'}", ok, f"x={L.x} y={L.y}")
+    for drop, survives in ((60, True), (61, False)):
+        w = _lab()
+        L = _put(w, 50, 120 - drop, St.FALL)
+        _run(w, 40)
+        st = L.state if not L.removed else "muerto"
+        check(f"caída de {drop} px {'se sobrevive' if survives else 'mata'}",
+              (st == St.WALK) if survives else (st in (St.SPLAT, "muerto")), str(st))
+    w = _lab()
+    L = _put(w, 50, 120, St.FALL)
+    L.floater = True
+    w.terrain.k[120:, :] = AIR
+    w.terrain.k[150:, :] = DIRT
+    L.y = 40
+    _run(w, 200)
+    check("el paracaidista sobrevive a 110 px", not L.removed and L.state == St.WALK, str(L.state))
+    w = _lab(200)
+    L = _put(w, 40, 120)
+    w.assign(L.id, Skill.BUILDER)
+    _run(w, BRICKS * BRICK_TICKS + 2)
+    bricks = int((w.terrain.k[:120] != AIR).sum())
+    check("el constructor pone 12 ladrillos de 6 px", bricks == BRICKS * 6 and L.state in (St.SHRUG, St.WALK),
+          f"{bricks} px, y={L.y}")
+    check("y termina 12 px más alto", L.y == 120 - BRICKS, f"y={L.y}")
+    w = _lab()
+    w.terrain.k[120:, :] = STEEL
+    L = _put(w, 60, 120)
+    w.assign(L.id, Skill.BOMBER)
+    _run(w, BOMB_TICKS + OHNO_TICKS + 5)
+    check("el acero resiste la bomba", int((w.terrain.k == STEEL).sum()) == 120 * 40 and L.removed)
+    w = _lab()
+    L = _put(w, 60, 120)
+    w.assign(L.id, Skill.BLOCKER)
+    w.assign(L.id, Skill.BOMBER)
+    _run(w, BOMB_TICKS + OHNO_TICKS + 5)
+    check("la bomba abre un cráter en la tierra", w.terrain.k[121, 60] == AIR and w.terrain.k[121, 80] == DIRT)
+    w = _lab()
+    w.terrain.k[135:, :] = STEEL
+    L = _put(w, 60, 120)
+    w.assign(L.id, Skill.DIGGER)
+    _run(w, 200)
+    check("el cavador se para en el acero", L.state == St.WALK and L.y == 135, f"{L.state} y={L.y}")
+    w = _lab(200)
+    w.terrain.k[90:120, 60:90] = DIRT
+    L = _put(w, 55, 120)
+    w.assign(L.id, Skill.BASHER)
+    _run(w, 120)
+    check("el excavador atraviesa un muro", L.x > 90 and L.state == St.WALK, f"x={L.x} {L.state}")
+    w = _lab(200)
+    w.terrain.k[90:120, 60:90] = OW_L
+    L = _put(w, 55, 120)
+    w.assign(L.id, Skill.BASHER)
+    _run(w, 40)
+    check("el muro de sentido único rechaza al excavador", L.x < 60 and L.dir == -1, f"x={L.x}")
+    w = _lab()
+    L = _put(w, 30, 120)
+    w.assign(L.id, Skill.MINER)
+    _run(w, MINE_TICKS * 10 + 1)
+    check("el picador baja en diagonal 1:2", L.y == 130 and L.x == 50, f"x={L.x} y={L.y}")
+    w = _lab()
+    w.terrain.k[60:120, 70:80] = DIRT
+    L = _put(w, 60, 120)
+    L.climber = True
+    crowned = False
+    for _ in range(200):
+        w.tick()
+        crowned |= L.state == St.WALK and L.y == 60 and 70 <= L.x < 80
+    check("el escalador corona el muro", crowned, f"x={L.x} y={L.y} {L.state}")
+    w = _lab()
+    blk = _put(w, 60, 120)
+    w.assign(blk.id, Skill.BLOCKER)
+    L = _put(w, 40, 120)
+    _run(w, 30)
+    check("el bloqueador da media vuelta a los demás", L.dir == -1 and L.x < 60, f"x={L.x}")
+
+    print("Niveles (solución automática):")
+    for i, lv in enumerate(LEVELS):
+        widths = {len(r) for r in lv.map}
+        w, log = simulate(i, Autopilot(lv.solution))
+        check(f"{i + 1:2d}. {lv.name}: {w.saved}/{lv.lemmings} (mín. {lv.to_save})",
+              w.success and len(widths) == 1, f"anchos {sorted(widths)}, ticks {w.tick_count}")
+        w2, _ = simulate(i, Replay(log))
+        check("    la repetición reproduce la partida", (w2.saved, w2.dead, w2.tick_count) == (w.saved, w.dead, w.tick_count),
+              f"{w2.saved}/{w2.dead}/{w2.tick_count} vs {w.saved}/{w.dead}/{w.tick_count}")
+        sig = lambda x: (x.saved, x.tick_count, int(x.terrain.k.sum()))  # noqa: E731
+        w3, _ = simulate(i, Autopilot(lv.solution))
+        check("    determinista", sig(w3) == sig(w))
+    print("Todo bien." if not fails else f"{fails} fallo(s).")
+    return 1 if fails else 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9. BUCLE PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="pylemmings", description="Clon de Lemmings en un único fichero.")
+    ap.add_argument("--level", type=int, choices=range(1, len(LEVELS) + 1), metavar="N", help="empezar en el nivel N")
+    ap.add_argument("--scale", type=int, default=3, help="escala de la ventana (por defecto 3)")
+    ap.add_argument("--selftest", action="store_true", help="probar física y niveles sin ventana")
+    ap.add_argument("--replay", metavar="FICHERO", help="reproducir una partida grabada")
+    ap.add_argument("--demo", type=int, choices=range(1, len(LEVELS) + 1), metavar="N", help="ver la solución del nivel N")
+    ap.add_argument("--mute", action="store_true", help="sin sonido")
+    ap.add_argument("--all", action="store_true", help="desbloquear todos los niveles")
+    args = ap.parse_args(argv)
+    if args.selftest:
+        return selftest()
+    App(args).run()
+    pygame.quit()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

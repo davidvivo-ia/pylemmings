@@ -1,264 +1,192 @@
 # pylemmings
 
-Un clon de *Lemmings* (DMA Design, 1991) escrito desde cero en **Python moderno (3.12+)**, en **un único fichero: `pylemmings.py`**.
+Un clon de *Lemmings* (DMA Design, 1991) escrito desde cero en **Python moderno (3.12+)**, en **un único fichero: `pylemmings.py`**. Trae 10 niveles propios, las 8 habilidades, sonido y música sintetizados, demos y repeticiones.
 
-Sin gráficos, sonidos ni niveles originales. Todo lo que se ve en pantalla se dibuja por código y todos los niveles se definen dentro del propio fichero. Del original solo copiamos la **mecánica**, que no tiene copyright. Su **expresión** sí lo tiene: sprites, niveles, música y nombres de nivel.
-
----
-
-## 1. Punto de partida: qué existe y qué no
-
-**Dato:** el código fuente original de 1991 (Amiga/DOS) **nunca se ha publicado oficialmente**. Los derechos son de Sony, heredera de Psygnosis. Si alguien ofrece "el fuente original", desconfiad.
-
-Lo que sí existe, de más a menos cercano al original, y para qué sirve en este proyecto:
-
-| Fuente | Qué es | Uso en pylemmings |
-|---|---|---|
-| **Mike Dailly – Lemmings para ZX Spectrum Next** (`github.com/mikedailly/Lemmings`) | Reescritura en Z80 de uno de los programadores originales. Código © Dailly 2017-2020, con permiso de uso libre, pero **sin** permiso para distribuirlo con gráficos o niveles originales. Trae documentación recopilada de los formatos de nivel y un conversor en C# de los assets de Windows. | **Referencia principal de la mecánica**: bucle de las criaturas, terreno destructible, máscaras. Sirve para leer y entender, no para copiar assets. |
-| **Port de Palm OS** (Ardiri & Kerchner, `palmdb.net/app/lemmings`) | Port no oficial con el código fuente completo liberado. | Segunda opinión sobre el bucle de juego en una máquina con pocos recursos. |
-| **rustlings** (`github.com/DirtyHairy/rustlings`, GPLv3) | Decodificador y visor de los ficheros DOS, en Rust con SDL2. | Para entender los formatos. **No** se copia código: pylemmings es MIT y la GPLv3 contaminaría la licencia. |
-| **modlem** (`davidgow.net/hacks/modlem.html`) | Herramienta para modificar los gráficos del port DOS. | Formato de sprites (solo como lectura). |
-| **resource_dasm / lemmings_render** | Genera mapas de niveles a partir de la versión Mac clásica. | Visualizar niveles originales y estudiar el diseño. |
-| **lemmings_3ds** | Homebrew en C para 3DS. | Estructura de un port pequeño en C. |
-| **NeoLemmix** (Delphi), **Lix** (D), **Pingus** (C++) | Clones libres. NeoLemmix es la réplica más fiel de la física. *(Sin verificar a día de hoy.)* | **Valores numéricos de la física** (tabla de la sección 5) y casos límite. |
-
-**Orden de estudio recomendado:** primero Dailly (quien diseñó el motor), luego NeoLemmix (para cotejar números y casos límite) y por último rustlings (formatos).
-
----
-
-## 2. Reglas del proyecto (no negociables)
-
-1. **Un solo fichero, `pylemmings.py`.** No hay paquetes, ni carpeta `assets/`, ni `levels/`. Si algo no cabe en el fichero, sobra.
-2. **Cero assets originales.** Los sprites son matrices de píxeles definidas como texto en el código, y los niveles son ASCII o se generan proceduralmente.
-3. **Física determinista.** Usamos *ticks* fijos y aritmética entera, y no aparece `dt` en la lógica. La misma partida con las mismas órdenes debe dar siempre el mismo resultado. Esto permite repeticiones (*replays*) y tests.
-4. **La lógica no sabe que existe pygame.** El núcleo de simulación funciona sin ventana, y así se puede testear en modo *headless*.
-5. **Licencia MIT** (ver `LICENSE`). Se puede leer código GPL para entender ideas, pero no se copia.
-
----
-
-## 3. Requisitos y ejecución
-
-- Python **3.12 o superior** (se usan `match`, `dataclass(slots=True)`, `enum.StrEnum` y tipado moderno).
-- **pygame-ce** ≥ 2.5 (el fork comunitario mantenido de pygame).
-- **numpy** ≥ 2.0 para el mapa de terreno.
-
-El fichero lleva sus dependencias embebidas con **PEP 723** (*inline script metadata*), así que no hace falta `requirements.txt`:
-
-```python
-# /// script
-# requires-python = ">=3.12"
-# dependencies = ["pygame-ce>=2.5", "numpy>=2.0"]
-# ///
-```
-
-Para ejecutarlo:
+No usa gráficos, sonidos ni niveles originales. Todo lo que se ve se dibuja por código y los niveles están escritos como texto dentro del propio fichero. Del original solo se toma la **mecánica**, que no tiene copyright. Su **expresión** sí lo tiene: sprites, niveles, música y nombres.
 
 ```bash
-# Opción recomendada (uv crea el entorno solo)
-uv run pylemmings.py
+uv run pylemmings.py                 # jugar (uv instala pygame-ce y numpy solo)
+python pylemmings.py --selftest      # física y los 10 niveles, sin ventana
+python pylemmings.py --demo 10       # ver la solución automática del nivel 10
+```
 
-# Opción clásica
+---
+
+## 1. Requisitos y ejecución
+
+- Python **3.12 o superior**.
+- **pygame-ce** ≥ 2.5 y **numpy** ≥ 2.0.
+
+Las dependencias van declaradas dentro del fichero con **PEP 723**, así que `uv run pylemmings.py` lo resuelve todo sin `requirements.txt`. La alternativa clásica:
+
+```bash
 python -m venv .venv && source .venv/bin/activate
 pip install pygame-ce numpy
 python pylemmings.py
 ```
 
-Opciones de línea de comandos previstas:
+| Opción | Efecto |
+|---|---|
+| `--level N` | Empieza en el nivel N, sin pasar por el menú. |
+| `--scale S` | Escala de la ventana. Por defecto 3, y se reduce sola si no cabe en la pantalla. |
+| `--demo N` | El autopiloto juega la solución del nivel N. |
+| `--replay F` | Reproduce una partida guardada con `R` en la pantalla de resultado. |
+| `--all` | Desbloquea todos los niveles. |
+| `--mute` | Sin sonido. |
+| `--selftest` | Tests de física y de niveles, sin ventana. |
 
-```bash
-python pylemmings.py --level 3        # empezar en un nivel concreto
-python pylemmings.py --scale 3        # escala de ventana (pixel art nítido)
-python pylemmings.py --selftest       # tests de física sin ventana (headless)
-python pylemmings.py --replay f.json  # reproducir una partida grabada
-```
+El progreso se guarda en `~/.pylemmings.json`. Si ese fichero no se puede escribir, el juego funciona igual.
 
 ---
 
-## 4. Arquitectura dentro del fichero único
+## 2. Controles
 
-El fichero se ordena en secciones fijas, de arriba abajo. Cada sección solo depende de las que tiene encima.
+| Tecla o ratón | Acción |
+|---|---|
+| Clic izquierdo en el mapa | Asignar la habilidad seleccionada |
+| `1`…`8` o clic en el panel | Elegir habilidad |
+| `+` / `-` (o `F2` / `F1`) | Subir o bajar la tasa de salida. Manteniendo pulsado el botón del panel, se repite. |
+| `Espacio` / `P` | Pausa (se puede asignar en pausa) |
+| `F` | Avance rápido ×4 |
+| `N` dos veces, o el botón rojo | Bomba nuclear |
+| Flechas, `A`/`D`, ratón en el borde, rueda | Scroll (`Shift` va más rápido) |
+| Clic en el minimapa | Saltar a esa zona |
+| `M` | Música sí/no |
+| `Esc` | Abandonar el nivel / volver al menú |
+
+**Prioridad del cursor:** si hay varios lemmings bajo el cursor, la habilidad va al que puede recibirla. Por ejemplo, nunca se da un constructor a uno que ya está construyendo.
+
+---
+
+## 3. Los diez niveles
+
+Todos son de diseño propio. Cada uno lleva su solución automática, que el `--selftest` ejecuta para demostrar que el nivel se puede ganar.
+
+| # | Nombre | Enseña | Lemmings / mínimo |
+|---|---|---|---|
+| 1 | Solo hay que cavar | Cavador | 10 / 6 |
+| 2 | Paracaídas para todos | Paracaidista | 10 / 8 |
+| 3 | Escaladores | Escalador | 10 / 9 |
+| 4 | Abre paso | Excavador | 10 / 9 |
+| 5 | Puente sobre el agua | Constructor + bloqueador + bombardero | 10 / 8 |
+| 6 | Cuesta abajo | Picador | 10 / 9 |
+| 7 | Dinamita | Bombardero contra suelos, entre paredes de acero | 10 / 8 |
+| 8 | Acero y sentido único | Construir sobre acero, excavar a favor de las flechas, cavar en la única grieta | 10 / 9 |
+| 9 | Puente y túnel | Combinación de cinco habilidades | 12 / 10 |
+| 10 | El gran final | Dos entradas, trampa, fuego, abismo y acero | 16 / 12 |
+
+Leyenda de los mapas (cada carácter es un bloque de 8×8 px; si un mapa tiene menos de 20 filas, se rellena con aire por arriba):
+
+```
+.  aire      #  tierra     S  acero      < >  un solo sentido
+/  rampa ↗   \  rampa ↘    _  medio bloque     =  plataforma fina
+~  agua      ^  fuego      T  trampa
+E  entrada → e  entrada ←  X  salida (con suelo debajo)
+```
+
+Un escalón de un bloque (8 px) ya es un **muro**, porque supera los 6 px que puede subir un caminante. Las rampas y los medios bloques sí se pueden caminar.
+
+---
+
+## 4. Arquitectura del fichero único
 
 ```
 pylemmings.py
-├── 0. Cabecera PEP 723, docstring, imports
-├── 1. CONSTANTES      tick, tamaños, tabla de física (sección 5)
-├── 2. SPRITES         pixel art como cadenas de texto → Surfaces al arrancar
-├── 3. TERRENO         clase Terrain: mapa numpy uint8 + operaciones de máscara
-├── 4. NIVELES         definiciones ASCII/procedurales + parser
-├── 5. LEMMING         dataclass + máquina de estados (un método por estado)
-├── 6. MUNDO           clase World: tick(), entradas, trampas, salida, recuento
-├── 7. RENDER          dibuja World sobre una Surface; no muta nada
-├── 8. INTERFAZ        panel de habilidades, cursor, minimapa, scroll
-├── 9. BUCLE PRINCIPAL lógica a paso fijo + render libre
-└── 10. SELFTEST       aserciones de física sin ventana
+├── 1. CONSTANTES      tick, física, máscaras de excavación
+├── 2. SPRITES         pixel art como cadenas de texto
+├── 3. TERRENO         Terrain: mapa numpy uint8 [y, x] + colores
+├── 4. NIVELES         mapas ASCII, parser y soluciones (Rule)
+├── 5. LEMMING         dataclass; la posición es el píxel de los PIES
+├── 6. MUNDO           World.tick(): determinista, sin pygame
+│      Autopilot / Replay / simulate()
+├── 7. RENDER          Renderer (solo lee el mundo) y Sfx sintetizado
+├── 8. INTERFAZ        App: menú, previa, partida, resultado
+├── 10. SELFTEST       física y niveles, sin ventana
+└── 9. main()          argumentos de línea de comandos
 ```
 
-### 4.1 Bucle a paso fijo
+Las decisiones de diseño:
 
-El original avanzaba la lógica a unos **17 ticks por segundo** (≈ 60 ms por tick). Ese ritmo es parte de la sensación del juego, así que se respeta. El render puede ir a 60 fps.
-
-```python
-TICK_MS = 60
-acc = 0
-while running:
-    acc += clock.tick(60)
-    while acc >= TICK_MS:
-        world.tick()          # lógica pura, determinista
-        acc -= TICK_MS
-    render(world, screen)     # solo lee
-```
-
-El avance rápido (*fast-forward*) llama a `world.tick()` varias veces por iteración y nunca cambia `TICK_MS`.
-
-### 4.2 Terreno: un mapa de bytes, no sprites
-
-Esta es la clave del motor original y también de este proyecto. El nivel es **un mapa de bits** en el que cada píxel guarda un tipo:
-
-```python
-AIR, DIRT, STEEL, ONEWAY_L, ONEWAY_R, WATER, FIRE = range(7)
-terrain = np.zeros((H, W), dtype=np.uint8)   # [y, x]
-```
-
-- **Colisión** = consultar un píxel: `terrain[y, x] != AIR`. No hay *bounding boxes*.
-- **Destruir** (bombardero, excavador, picador, minero) = aplicar una **máscara booleana** con `np.where`. El acero nunca se borra.
-- **Construir** (constructor) = pintar píxeles `DIRT`.
-- La *Surface* visible se regenera solo en la zona sucia (*dirty rect*), nunca entera en cada tick.
-- Los bordes del mapa se tratan como aire en los laterales y como muerte por debajo del suelo.
-
-### 4.3 El lemming
-
-```python
-@dataclass(slots=True)
-class Lemming:
-    x: int            # píxel de los PIES, no esquina superior
-    y: int
-    dir: int          # +1 derecha, -1 izquierda
-    state: State      # WALK, FALL, FLOAT, CLIMB, BUILD, BASH, MINE, DIG, BLOCK, ...
-    frame: int = 0
-    fall_dist: int = 0
-    is_climber: bool = False   # permanente
-    is_floater: bool = False   # permanente
-    bomb_timer: int | None = None
-    bricks_left: int = 0
-```
-
-La posición se toma en **los pies**, igual que en el original y en NeoLemmix. Todas las consultas de terreno son relativas a ese píxel.
-
-La máquina de estados es un `match self.state:` que despacha a un método por estado. Cada método solo puede devolver un estado nuevo o `None`, y no toca el estado de otros lemmings. La única excepción son los bloqueadores: `World` resuelve su efecto antes de mover a nadie.
+- **El terreno es un mapa de bytes.** Chocar es leer un píxel. Destruir es aplicar una máscara booleana de numpy (círculo, túnel o diagonal), y el acero y las paredes de un solo sentido se respetan. Construir es pintar píxeles. La superficie visible se regenera solo en el rectángulo que ha cambiado.
+- **Paso fijo de 17 ticks/s y aritmética entera.** El render va a 60 fps por separado.
+- **El mundo es determinista y no depende de pygame.** Las órdenes del jugador son tuplas (`("assign", id, skill)`, `("rr", v)`, `("nuke",)`) que se aplican antes de un tick concreto. Así una repetición es solo la lista de órdenes con su tick, y el autopiloto usa el mismo camino que el ratón.
+- **Los bordes laterales del mapa son muros que no se pueden trepar.** Caer por debajo del mapa mata.
 
 ---
 
-## 5. Física de referencia
+## 5. Física
 
-Valores tomados de la documentación comunitaria y de NeoLemmix, que reproduce el original. **Hay que cotejarlos con el repo de Dailly antes de dar el motor por cerrado.** Están todos en el bloque `CONSTANTES` para poder ajustarlos sin buscar números mágicos.
+Las constantes están al principio del fichero. Se han **contrastado con el código fuente del port de Palm OS** (Ardiri y Kerchner, el más cercano al original) **y con Lix**. Lix trabaja a doble resolución, así que sus valores se dividen entre dos.
 
-| Parámetro | Valor de referencia | Confianza |
+| Parámetro | pylemmings | Referencia |
 |---|---|---|
-| Ticks de lógica | ~17/s (60 ms) | Alta |
-| Tamaño de nivel (DOS) | 1600 × 160 px | Alta |
-| Ventana de juego | 320 × 160 px + panel inferior | Alta |
-| Avance al caminar | 1 px/tick | Alta |
-| Escalón máximo que sube caminando | 6 px (si es más alto: da la vuelta, o trepa si es escalador) | Alta |
-| Bajada máxima sin pasar a caer | 3 px | Media |
-| Velocidad de caída | 3 px/tick | Media |
-| Caída mortal | > 60 px (sin paraguas) | Alta |
-| Constructor | 12 ladrillos de 6 px de ancho y 1 px de alto; aviso en los 3 últimos | Alta |
-| Bombardero | Cuenta atrás de 5 s, cráter circular, no destruye acero | Alta |
-| Tasa de salida (*release rate*) | 1–99; intervalo ≈ `53 - RR // 2` ticks | Media, a verificar |
-| Lemming | ≈ 10 px de alto | Media |
+| Ticks/s | 17 | Lix 15, Palm 12,5 (escalado); DOS ≈ 15–17 |
+| Escalón que se sube | 6 px | Lix 12 hi-res = 6 |
+| Bajada sin caer | 3 px | Lix < 7 hi-res ≈ 3 |
+| Caída | 3 px/tick | DOS constante 3 (Lix acelera a propósito) |
+| Caída mortal | > 60 px | Lix > 63, Palm ≥ 56 (escalado) |
+| Paraguas | se abre tras ~30 px | Lix 60 hi-res = 30 |
+| Escalador | ½ px/tick | Palm 1 px cada 2 frames; Lix 8 hi-res / 8 frames |
+| Constructor | 12 ladrillos de 6×1, +2 / −1 por ladrillo, 16 ticks cada uno, aviso en los 3 últimos | Coinciden Palm y Lix |
+| Cavador | 9 px de ancho, 1 fila cada 8 ticks | Palm 1 fila/8 frames; Lix 18 hi-res = 9 |
+| Picador | +2 / +1 cada 12 ticks | Pendiente 1:2 |
+| Bombardero | 5 s, «¡oh, no!» de 16 ticks (sin él si va por el aire), cráter de radio 16 centrado 6 px sobre los pies | Lix: centro 6 px sobre el pie, radio 11 |
+| Bloqueador | campo de ±6 px | Lix \|dx\| < 14 hi-res ≈ 7 |
+| Tasa de salida | `max(4, 53 − RR // 2)` ticks | Equivale a la fórmula *legacy* de Lix `4 + (99 − RR) / 2` |
 
-Algunos **casos límite** que el motor debe reproducir porque forman parte del diseño de niveles clásico:
-
-- El bloqueador da la vuelta a los que llegan, pero **no** a los que caen sobre él.
-- Si un constructor choca contra la pared, se detiene y da media vuelta.
-- Si un excavador o picador toca acero, se detiene.
-- Una pared de un solo sentido (*one-way*) solo deja excavar en su dirección.
-- Escalador más paracaidista es un *athlete*: ambos rasgos son permanentes y se acumulan.
-- La bomba nuclear (*nuke*) pone a todos en cuenta atrás y corta la salida de nuevos lemmings.
+El cráter es deliberadamente más grande que el de Lix: el nivel 7 está diseñado para ese radio.
 
 ---
 
-## 6. Las ocho habilidades
+## 6. Calidad y tests
 
-| Tecla | Habilidad | Tipo | Efecto sobre el terreno |
-|---|---|---|---|
-| `1` | Escalador (*Climber*) | permanente | — |
-| `2` | Paracaidista (*Floater*) | permanente | — |
-| `3` | Bombardero (*Bomber*) | temporizada | borra un círculo |
-| `4` | Bloqueador (*Blocker*) | estado | — |
-| `5` | Constructor (*Builder*) | estado | pinta una escalera |
-| `6` | Excavador (*Basher*) | estado | túnel horizontal |
-| `7` | Picador (*Miner*) | estado | túnel diagonal hacia abajo |
-| `8` | Cavador (*Digger*) | estado | pozo vertical |
-
-Otros controles:
-
-- `+` / `-`: subir o bajar la tasa de salida.
-- `P`: pausa.
-- `F`: avance rápido.
-- `N` dos veces: bomba nuclear.
-- Flechas o ratón en el borde: scroll.
-- Clic izquierdo: asignar la habilidad seleccionada.
-
-**Prioridad del cursor:** cuando hay varios lemmings bajo el cursor, la habilidad se asigna al que puede recibirla y no a uno que ya la tiene. Por ejemplo, no se da un constructor al que ya está construyendo. Sin esta regla el juego resulta injugable.
-
----
-
-## 7. Niveles
-
-Los niveles se definen en el propio fichero como **ASCII**, con una leyenda simple, y se escalan a píxeles al cargarlos:
-
-```
-# Cada carácter equivale a un bloque de 8×8 px
-LEVEL_1 = Level(
-    name="Primeros pasos",
-    lemmings=10, to_save=5, release_rate=50, time_s=300,
-    skills={"dig": 10},
-    map="""
-.....E..........................
-................................
-######################.....#####
-######################.....##X##
-################################
-""")
-# E = entrada (trampilla)   X = salida   # = tierra
-# S = acero   < > = un solo sentido   ~ = agua   ^ = fuego
+```bash
+python pylemmings.py --selftest
+ruff check pylemmings.py
 ```
 
-El objetivo es tener unos 10 niveles de dificultad creciente, **todos de diseño propio**. Está prohibido transcribir niveles originales, aunque sea "de memoria".
+El selftest comprueba, sin ventana:
 
-A medio plazo se añadirá un generador procedural con semilla (`--seed`) para partidas infinitas.
-
----
-
-## 8. Hoja de ruta
-
-Cada hito es jugable y se puede comprobar por sí mismo:
-
-1. **Terreno + caminante.** Un mapa numpy, un lemming que camina, sube escalones, cae y muere. `--selftest` verifica escalón y caída mortal.
-2. **Entrada, salida, tasa de salida y recuento.** Ya es un juego: se gana o se pierde.
-3. **Habilidades destructivas:** cavador, excavador, picador y bombardero (máscaras).
-4. **Constructor y bloqueador.**
-5. **Escalador y paracaidista.**
-6. **Acero, paredes de un solo sentido, agua, fuego y trampas.**
-7. **Interfaz completa:** panel, minimapa, scroll, pausa, avance rápido y bomba nuclear.
-8. **Replays deterministas** (lista de `(tick, lemming_id, skill)` en JSON).
-9. **Sonido sintetizado** con `pygame.sndarray`, sin muestras externas.
-10. **Pulido:** paletas de color, animaciones y transiciones.
+- **Física:**
+  - Un escalón de 6 px se sube y uno de 7 px es un muro.
+  - Una caída de 60 px se sobrevive y una de 61 px mata.
+  - El paracaidista sobrevive a 110 px.
+  - El constructor pone 12 ladrillos de 6 px.
+  - El acero resiste la bomba y la tierra no.
+  - El cavador se para en el acero.
+  - El excavador atraviesa un muro, salvo uno de sentido contrario.
+  - El picador baja en pendiente 1:2.
+  - El escalador corona el muro.
+  - El bloqueador da media vuelta a los demás.
+- **Niveles:** cada uno se gana con su solución, una repetición grabada reproduce la partida exactamente y dos ejecuciones dan el mismo terreno final.
 
 ---
 
-## 9. Calidad
+## 7. Fuentes consultadas
 
-- `ruff check pylemmings.py && ruff format pylemmings.py` antes de cada commit.
-- Tipado completo y validado con `mypy --strict` o `pyright`.
-- `python pylemmings.py --selftest` debe pasar siempre. Comprueba la física en modo *headless* (`SDL_VIDEODRIVER=dummy`): escalón de 6 px frente a 7 px, caída de 60 px frente a 61 px, que el constructor coloca 12 ladrillos y que el acero resiste al bombardero.
-- Si los tests empiezan a crecer, se pueden mover a `test_pylemmings.py` con pytest. Es la única excepción tolerada a la regla del fichero único, y solo para tests.
+**Dato:** el código original de 1991 nunca se ha publicado; los derechos son de Sony (heredera de Psygnosis).
+
+| Fuente | Estado | Uso |
+|---|---|---|
+| Port de Palm OS, `github.com/ardiri/palmos-lemmings` (y el `lemmings-4.2-foss.zip` de palmdb.net) | Descargado y leído | Física de referencia |
+| **Lix**, `github.com/SimonN/LixD` | Descargado y leído | Física (dividida entre dos) |
+| **Pingus**, `github.com/Pingus/pingus` | Descargado | Consulta |
+| **rustlings**, `github.com/DirtyHairy/rustlings` (GPLv3) | Descargado | Formatos; no se copia código, por la licencia |
+| **modlem**, `github.com/sulix/modlem`, y `digger-decoder` | Descargados | Formatos de gráficos |
+| **resource_dasm** (`lemmings_render`) | Descargado | Formatos Mac |
+| `lemmings_lvl_file_format.txt` (camanis.net) | Descargado | Formato de nivel DOS |
+| **Mike Dailly**, `github.com/mikedailly/Lemmings` | **No accesible**: esa ruta no responde como repositorio público | Pendiente de verificar la URL |
+| **NeoLemmix** | La web responde, pero no se ha localizado el repositorio de código | Pendiente |
+| **lemmings_3ds** | Sin URL concreta | Pendiente |
+
+De ninguna de estas fuentes se ha copiado código ni assets. Solo se han contrastado números.
 
 ---
 
-## 10. Aviso legal
+## 8. Aviso legal
 
-*Lemmings* es una marca y una obra protegida cuyos derechos pertenecen a Sony Interactive Entertainment (antes Psygnosis). Este proyecto no está afiliado a sus titulares ni lo respaldan. **No contiene ni distribuye** código, gráficos, sonidos ni niveles originales. Las mecánicas de juego no son objeto de copyright, pero su expresión sí, y por eso aquí todo es de creación propia.
+*Lemmings* es una obra protegida cuyos derechos pertenecen a Sony Interactive Entertainment (antes Psygnosis). Este proyecto no está afiliado a sus titulares ni lo respaldan. **No contiene ni distribuye** código, gráficos, sonidos ni niveles originales.
+
+La melodía es una composición propia y los niveles son de diseño propio.
 
 Licencia: **MIT** (ver [`LICENSE`](LICENSE)).
